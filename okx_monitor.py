@@ -4,13 +4,13 @@ import json
 import requests
 import time
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from flask import Flask
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==================== 版本信息 ====================
-VERSION = "1.9.0"
+VERSION = "1.9.1"  # 修复语法错误和弃用警告
 
 # ==================== 配置区 ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -35,7 +35,7 @@ VOLUME_THRESHOLD = 1000000
 ALERT_COOLDOWN = 120
 SUMMARY_MIN_DIFF = 0.3
 
-# ==================== v1.9.0 新增配置 ====================
+# ==================== v1.9.0 配置 ====================
 ATR_ADJUST_FACTOR = 0.5
 ZSCORE_MIN = 1.0
 ZSCORE_MAX = 2.5
@@ -216,7 +216,7 @@ def get_market_sentiment():
             data = resp.json()
             if data["code"] == "0" and data["data"]:
                 changes.append(float(data["data"][0]["priceChangePercent"]))
-                volumes.append(float(data["data"][0vol]["Ccy24h"]))
+                volumes.append(float(data["data"][0]["volCcy24h"]))
         if not changes:
             return 50
         avg_change = sum(changes) / len(changes)
@@ -443,7 +443,7 @@ def get_whale_score(symbol):
         return 0
 
 def update_candle_cache(symbol, close_price, volume):
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     if symbol not in price_candle_cache:
         price_candle_cache[symbol] = []
     price_candle_cache[symbol].append((now, close_price, volume))
@@ -482,7 +482,7 @@ def calculate_position(current_price, atr_pct, score, account_balance=ACCOUNT_BA
     return max(1, int(contract_size))
 
 def get_session_score():
-    hour = datetime.utcnow().hour
+    hour = datetime.now(timezone.utc).hour
     if 12 <= hour <= 18:
         return 10
     elif 22 <= hour or hour <= 2:
@@ -755,7 +755,6 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
         else:
             details.append(f"基差{premium:+.2f}%正常")
 
-    # v1.9.0 订单簿不平衡
     imbalance = get_orderbook_imbalance(symbol)
     if signal_type == "LONG" and imbalance > 0:
         score += min(imbalance, 15)
@@ -1613,7 +1612,7 @@ def run_telegram_bot():
         app.add_handler(CommandHandler("setvolatility", setvolatility))
         app.add_handler(CommandHandler("sentiment", sentiment))
         app.add_handler(CommandHandler("debug", debug))
-        print("🤖 Telegram Bot 正在运行 (主线程)")
+        print("🤖 Telegram Bot 正在运行")
         app.run_polling()
     except Exception as e:
         print(f"❌ Telegram Bot 启动失败: {e}")
@@ -1639,7 +1638,7 @@ def send_startup_notification():
     msg = (
         f"🚀 **Bot 已重新启动！**\n"
         f"版本: {VERSION}\n"
-        f"启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"启动时间: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
         f"监控币种: {len(alt_symbols)} 个合约币种\n"
         f"市场情绪: {sentiment_val}/100\n"
         f"动态阈值: 多 {get_dynamic_zscore_threshold('BTC-USDT', 'LONG'):.2f} / 空 {get_dynamic_zscore_threshold('BTC-USDT', 'SHORT'):.2f}\n"
@@ -1649,12 +1648,11 @@ def send_startup_notification():
 
 # ==================== 主程序 ====================
 if __name__ == "__main__":
-    print(f"🚀 合约胜率增强版 v{VERSION} 启动于 {datetime.now()}")
+    print(f"🚀 合约胜率增强版 v{VERSION} 启动于 {datetime.now(timezone.utc)}")
     print(f"初始监控: {BTC_SYMBOL} + {', '.join(DEFAULT_ALT_SYMBOLS)}")
     print(f"基础 Z-Score 阈值: 多 {ZSCORE_BASE_LONG} / 空 {ZSCORE_BASE_SHORT}")
     print(f"自动过滤: 保留前 {MAX_COINS} 名")
 
-    # 启动后台线程
     threading.Thread(target=verify_loop, daemon=True).start()
     threading.Thread(target=auto_scan_new_coins, daemon=True).start()
     threading.Thread(target=auto_filter_coins, daemon=True).start()
@@ -1662,13 +1660,10 @@ if __name__ == "__main__":
     threading.Thread(target=independent_scanner, daemon=True).start()
     threading.Thread(target=start_ws, daemon=True).start()
 
-    # Telegram Bot 后台启动
     print("🤖 正在后台线程启动 Telegram Bot...")
     bot_thread = threading.Thread(target=run_telegram_bot, daemon=True)
     bot_thread.start()
 
-    # 启动通知（后台）
     threading.Thread(target=send_startup_notification, daemon=True).start()
 
-    # 主线程运行 Flask
     run_http()
