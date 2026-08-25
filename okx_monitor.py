@@ -10,7 +10,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==================== 版本信息 ====================
-VERSION = "1.4.0"   # 更新代码时手动修改此版本号
+VERSION = "1.5.0"
 
 # ==================== 配置区（从环境变量读取） ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -40,7 +40,7 @@ STATS_LOCK = threading.Lock()
 
 # ==================== 自动过滤配置 ====================
 AUTO_FILTER_ENABLED = True
-MAX_COINS = 150
+MAX_COINS = 200                      # 已从 150 调整为 200
 FILTER_INTERVAL = 1800
 
 # ==================== 波动扫描配置 ====================
@@ -87,7 +87,26 @@ def send_telegram(msg):
     except:
         print(f"推送失败: {msg}")
 
-# ==================== 1. RSI 计算 ====================
+# ==================== 1. 获取合约列表 ====================
+def get_swap_symbols():
+    """获取 OKX 所有 USDT 永续合约的标的名称（如 BTC-USDT）"""
+    try:
+        url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        if data["code"] != "0":
+            return set()
+        symbols = set()
+        for inst in data["data"]:
+            if inst["settleCcy"] == "USDT":
+                base = "-".join(inst["instId"].split("-")[:2])
+                symbols.add(base)
+        return symbols
+    except Exception as e:
+        print(f"获取合约列表失败: {e}")
+        return set()
+
+# ==================== 2. RSI 计算 ====================
 def calculate_rsi(symbol, interval="15m", limit=50):
     try:
         url = f"https://www.okx.com/api/v5/market/history-candles?instId={symbol}&bar={interval}&limit={limit}"
@@ -113,7 +132,7 @@ def calculate_rsi(symbol, interval="15m", limit=50):
     except:
         return 50
 
-# ==================== 2. 资金费率 ====================
+# ==================== 3. 资金费率 ====================
 def get_funding_rate(symbol):
     try:
         swap_symbol = symbol.replace("-USDT", "-USDT-SWAP")
@@ -126,10 +145,9 @@ def get_funding_rate(symbol):
     except:
         return 0.0
 
-# ==================== 3. 多因子评分 ====================
+# ==================== 4. 多因子评分 ====================
 def analyze_signal(symbol, diff, btc_change, alt_change, volume, use_independent=False):
     if use_independent:
-        # 独立行情模式：只看涨跌幅方向
         if alt_change > 0:
             signal_type = "LONG"
         elif alt_change < 0:
@@ -202,7 +220,7 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, use_independent
     final_score = max(0, min(100, score))
     return signal_type, final_score, " | ".join(details)
 
-# ==================== 4. 背离检测（主逻辑） ====================
+# ==================== 5. 背离检测 ====================
 def check_divergence():
     btc = price_data[BTC_SYMBOL]
     btc_change = btc["change"]
@@ -222,11 +240,9 @@ def check_divergence():
         if sym in last_alert_time and (now - last_alert_time[sym]) < ALERT_COOLDOWN:
             continue
 
-        # 只有当 BTC 有趋势时才用背离逻辑
         if abs(btc_change) > 0.3:
             signal_type, score, details = analyze_signal(sym, diff, btc_change, alt_change, volume, use_independent=False)
         else:
-            # BTC 横盘，跳过，交给独立行情扫描
             continue
 
         if signal_type and score >= 50:
@@ -262,7 +278,7 @@ def check_divergence():
                     "status": "pending"
                 })
 
-# ==================== 5. 验证循环 ====================
+# ==================== 6. 验证循环 ====================
 def verify_loop():
     while True:
         time.sleep(60)
@@ -329,7 +345,7 @@ def verify_loop():
             for idx in sorted(to_remove, reverse=True):
                 PENDING_SIGNALS.pop(idx)
 
-# ==================== 6. WebSocket ====================
+# ==================== 7. WebSocket ====================
 def restart_websocket():
     global ws_instance, restart_flag
     with ws_lock:
@@ -385,7 +401,7 @@ def start_ws():
         ws.run_forever()
         time.sleep(2)
 
-# ==================== 7. 币种管理 ====================
+# ==================== 8. 币种管理（含合约过滤） ====================
 def add_symbol(symbol):
     if symbol == BTC_SYMBOL or symbol in alt_symbols:
         return False
@@ -413,14 +429,27 @@ def clear_alts():
 
 def add_top_n(n):
     try:
+        swap_symbols = get_swap_symbols()
+        if not swap_symbols:
+            print("⚠️ 未获取到合约列表，将使用全部现货")
+        
         resp = requests.get("https://www.okx.com/api/v5/market/tickers?instType=SPOT", timeout=10)
         data = resp.json()
         if data["code"] != "0":
             return []
         tickers = data["data"]
-        usdt_tickers = [t for t in tickers if t["instId"].endswith("-USDT") and t["instId"] != BTC_SYMBOL]
-        sorted_tickers = sorted(usdt_tickers, key=lambda x: float(x.get("vol24h", 0)), reverse=True)
+
+        usdt_tickers = []
+        for t in tickers:
+            inst_id = t["instId"]
+            if inst_id.endswith("-USDT") and inst_id != BTC_SYMBOL:
+                if swap_symbols and inst_id not in swap_symbols:
+                    continue
+                usdt_tickers.append(t)
+
+        sorted_tickers = sorted(usdt_tickers, key=lambda x: float(x.get("volCcy24h", 0)), reverse=True)
         top = [t["instId"] for t in sorted_tickers[:n]]
+
         added = []
         for sym in top:
             if sym not in alt_symbols:
@@ -434,36 +463,19 @@ def add_top_n(n):
         print(f"获取交易量排行失败: {e}")
         return []
 
-def add_all_usdt():
-    try:
-        resp = requests.get("https://www.okx.com/api/v5/public/instruments?instType=SPOT", timeout=10)
-        data = resp.json()
-        if data["code"] != "0":
-            return []
-        instruments = data["data"]
-        usdt_symbols = [inst["instId"] for inst in instruments if inst["quoteCcy"] == "USDT" and inst["instId"] != BTC_SYMBOL]
-        added = []
-        for sym in usdt_symbols:
-            if sym not in alt_symbols:
-                alt_symbols.add(sym)
-                price_data[sym] = {"price": 0, "change": 0, "volume": 0}
-                added.append(sym)
-        if added:
-            restart_websocket()
-        return added
-    except Exception as e:
-        print(f"获取所有币种失败: {e}")
-        return []
-
 def auto_scan_new_coins():
     known_symbols = set(alt_symbols)
     while True:
         try:
+            swap_symbols = get_swap_symbols()
             resp = requests.get("https://www.okx.com/api/v5/public/instruments?instType=SPOT", timeout=10)
             data = resp.json()
             if data["code"] == "0":
-                current_usdt = [inst["instId"] for inst in data["data"] if inst["quoteCcy"] == "USDT"]
-                new_coins = [s for s in current_usdt if s not in known_symbols and s != BTC_SYMBOL]
+                current_usdt = [inst["instId"] for inst in data["data"] if inst["quoteCcy"] == "USDT" and inst["instId"] != BTC_SYMBOL]
+                new_coins = []
+                for sym in current_usdt:
+                    if sym not in known_symbols and (not swap_symbols or sym in swap_symbols):
+                        new_coins.append(sym)
                 if new_coins:
                     for sym in new_coins:
                         if sym not in alt_symbols:
@@ -471,12 +483,12 @@ def auto_scan_new_coins():
                             price_data[sym] = {"price": 0, "change": 0, "volume": 0}
                     known_symbols.update(new_coins)
                     restart_websocket()
-                    send_telegram(f"🆕 自动发现新币种并已添加监控: {', '.join(new_coins)}")
+                    send_telegram(f"🆕 自动发现新合约币种并已添加监控: {', '.join(new_coins)}")
         except Exception as e:
             print(f"自动扫描出错: {e}")
         time.sleep(3600)
 
-# ==================== 8. 自动过滤小币种 ====================
+# ==================== 9. 自动过滤小币种（合约+成交额） ====================
 def auto_filter_coins():
     global alt_symbols, price_data
     while True:
@@ -484,20 +496,32 @@ def auto_filter_coins():
         if not AUTO_FILTER_ENABLED:
             continue
         try:
+            swap_symbols = get_swap_symbols()
+            if not swap_symbols:
+                print("⚠️ 未获取到合约列表，跳过本次过滤")
+                continue
+
             resp = requests.get("https://www.okx.com/api/v5/market/tickers?instType=SPOT", timeout=10)
             data = resp.json()
             if data["code"] != "0":
                 continue
             tickers = data["data"]
-            usdt_tickers = [t for t in tickers if t["instId"].endswith("-USDT") and t["instId"] != BTC_SYMBOL]
-            sorted_tickers = sorted(usdt_tickers, key=lambda x: float(x.get("vol24h", 0)), reverse=True)
+
+            usdt_tickers = []
+            for t in tickers:
+                inst_id = t["instId"]
+                if inst_id.endswith("-USDT") and inst_id != BTC_SYMBOL:
+                    if inst_id in swap_symbols:
+                        usdt_tickers.append(t)
+
+            sorted_tickers = sorted(usdt_tickers, key=lambda x: float(x.get("volCcy24h", 0)), reverse=True)
             top_symbols = [t["instId"] for t in sorted_tickers[:MAX_COINS]]
-            
+
             current_set = set(alt_symbols)
             target_set = set(top_symbols)
             to_add = target_set - current_set
             to_remove = current_set - target_set - {BTC_SYMBOL}
-            
+
             if to_add or to_remove:
                 for sym in to_remove:
                     alt_symbols.remove(sym)
@@ -505,11 +529,11 @@ def auto_filter_coins():
                 for sym in to_add:
                     alt_symbols.add(sym)
                     price_data[sym] = {"price": 0, "change": 0, "volume": 0}
-                
+
                 restart_websocket()
                 msg = (
                     f"🔄 自动过滤已更新监控列表\n"
-                    f"保留交易量前 {MAX_COINS} 的币种\n"
+                    f"保留成交额前 {MAX_COINS} 的合约币种\n"
                     f"添加: {', '.join(list(to_add)[:5])}" + ("..." if len(to_add)>5 else "") + "\n"
                     f"移除: {', '.join(list(to_remove)[:5])}" + ("..." if len(to_remove)>5 else "")
                 )
@@ -517,7 +541,7 @@ def auto_filter_coins():
         except Exception as e:
             print(f"自动过滤出错: {e}")
 
-# ==================== 9. 波动扫描（小币种异动） ====================
+# ==================== 10. 波动扫描 ====================
 def volatility_scanner():
     cache = {}
     while True:
@@ -563,7 +587,7 @@ def volatility_scanner():
         except Exception as e:
             print(f"波动扫描出错: {e}")
 
-# ==================== 10. 独立行情监控（BTC横盘时） ====================
+# ==================== 11. 独立行情监控 ====================
 def independent_scanner():
     cache = {}
     while True:
@@ -603,16 +627,12 @@ def independent_scanner():
                 
                 price_change = (current_price - prev["price"]) / prev["price"] * 100
                 if abs(price_change) >= INDEPENDENT_THRESHOLD:
-                    # 获取评分因子
                     rsi = calculate_rsi(symbol)
                     funding = get_funding_rate(symbol)
                     volume = float(item.get("vol24h", 0))
                     
-                    # 使用独立评分
                     alt_change = price_change
                     signal_type = "LONG" if alt_change > 0 else "SHORT"
-                    # 复用 analyze_signal，但传入 use_independent=True
-                    # 但由于函数设计，我们直接构建
                     details = []
                     base_score = min(50, 30 + abs(alt_change) * 8)
                     score = base_score
@@ -688,7 +708,7 @@ def independent_scanner():
         except Exception as e:
             print(f"独立行情监控出错: {e}")
 
-# ==================== 11. 汇总 ====================
+# ==================== 12. 汇总 ====================
 def generate_summary():
     btc = price_data[BTC_SYMBOL]
     btc_change = btc["change"]
@@ -724,7 +744,7 @@ def generate_summary():
         lines.append(f"\n⚪ 中性（背离≤±{SUMMARY_MIN_DIFF}%）: {len(neutral)} 个")
     return header + "\n".join(lines)
 
-# ==================== 12. 自动刷新 ====================
+# ==================== 13. 自动刷新 ====================
 def auto_refresh_job():
     global auto_refresh_timer
     if auto_refresh_enabled:
@@ -750,7 +770,7 @@ def stop_auto_refresh():
         auto_refresh_timer.cancel()
         auto_refresh_timer = None
 
-# ==================== 13. Telegram命令 ====================
+# ==================== 14. Telegram命令 ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
         return
@@ -762,7 +782,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/summary - 立即获取强弱汇总\n"
         "/autorefresh on/off/<分钟> - 控制自动刷新\n"
         "/addcoin <币种> - 添加单个\n"
-        "/addtop <数量> - 添加交易量前N\n"
+        "/addtop <数量> - 添加成交额前N（仅合约）\n"
         "/removecoin <币种> - 移除\n"
         "/clear - 清空所有山寨币\n"
         "/setvolatility <数值> - 设置波动扫描阈值(0.5~20%)\n"
@@ -792,7 +812,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     volatility_status = "🟢 开启" if VOLATILITY_SCAN_ENABLED else "🔴 关闭"
     independent_status = "🟢 开启" if INDEPENDENT_MODE_ENABLED else "🔴 关闭"
     msg = (
-        f"📋 监控: {count} 个山寨币\n"
+        f"📋 监控: {count} 个山寨币（仅合约）\n"
         f"自动刷新: {status_auto}"
         f"{f' (间隔 {interval_min} 分钟)' if auto_refresh_enabled else ''}\n"
         f"自动过滤: {filter_status} (保留前 {MAX_COINS} 名)\n"
@@ -871,16 +891,16 @@ async def addcoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def addtop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
         return
-    n = 50
+    n = 200
     if context.args and context.args[0].isdigit():
         n = int(context.args[0])
-    if n > 200:
-        await update.message.reply_text("⚠️ 数量过大，建议≤200", reply_markup=get_main_keyboard())
-        n = 200
-    await update.message.reply_text(f"⏳ 获取交易量前{n}的币种...", reply_markup=get_main_keyboard())
+    if n > 300:
+        await update.message.reply_text("⚠️ 数量过大，建议≤300", reply_markup=get_main_keyboard())
+        n = 300
+    await update.message.reply_text(f"⏳ 获取成交额前{n}的合约币种...", reply_markup=get_main_keyboard())
     added = add_top_n(n)
     if added:
-        await update.message.reply_text(f"✅ 添加 {len(added)} 个: {', '.join(added[:10])}" + ("..." if len(added)>10 else ""), reply_markup=get_main_keyboard())
+        await update.message.reply_text(f"✅ 添加 {len(added)} 个合约币种: {', '.join(added[:10])}" + ("..." if len(added)>10 else ""), reply_markup=get_main_keyboard())
     else:
         await update.message.reply_text("⚠️ 无新币种", reply_markup=get_main_keyboard())
 
@@ -930,7 +950,7 @@ async def setvolatility(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("⚠️ 请输入有效的数字，如 /setvolatility 3.5", reply_markup=get_main_keyboard())
 
-# ==================== 14. Telegram Bot ====================
+# ==================== 15. Telegram Bot ====================
 def run_telegram_bot():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -946,7 +966,7 @@ def run_telegram_bot():
     print("🤖 Telegram Bot 正在运行 (主线程)")
     app.run_polling()
 
-# ==================== 15. Flask心跳 ====================
+# ==================== 16. Flask心跳 ====================
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -956,27 +976,28 @@ def health():
 def run_http():
     flask_app.run(host='0.0.0.0', port=10000)
 
-# ==================== 16. 启动通知 ====================
+# ==================== 17. 启动通知 ====================
 def send_startup_notification():
     time.sleep(8)
     msg = (
         f"🚀 **Bot 已重新启动！**\n"
         f"版本: {VERSION}\n"
         f"启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"监控币种: {len(alt_symbols)} 个山寨币\n"
+        f"监控币种: {len(alt_symbols)} 个合约币种\n"
+        f"自动过滤: 保留成交额前 {MAX_COINS} 名\n"
         f"独立行情: {'开启' if INDEPENDENT_MODE_ENABLED else '关闭'}\n"
         f"使用 /status 查看详情"
     )
     send_telegram(msg)
 
-# ==================== 17. 主程序 ====================
+# ==================== 18. 主程序 ====================
 if __name__ == "__main__":
     print(f"🚀 合约胜率增强版 v{VERSION} 启动于 {datetime.now()}")
     print(f"初始监控: {BTC_SYMBOL} + {', '.join(DEFAULT_ALT_SYMBOLS)}")
+    print(f"MAX_COINS: {MAX_COINS} | 自动过滤: {'开启' if AUTO_FILTER_ENABLED else '关闭'}")
     print(f"验证阈值: {VERIFY_PRICE_CHANGE_PCT}% | 等待时间: {VERIFY_MINUTES}分钟")
-    print(f"自动过滤: {'开启' if AUTO_FILTER_ENABLED else '关闭'}，保留前 {MAX_COINS} 名，间隔 {FILTER_INTERVAL//60} 分钟")
-    print(f"波动扫描: {'开启' if VOLATILITY_SCAN_ENABLED else '关闭'}，阈值 {VOLATILITY_THRESHOLD}%，间隔 {VOLATILITY_SCAN_INTERVAL} 秒")
-    print(f"独立行情: {'开启' if INDEPENDENT_MODE_ENABLED else '关闭'}，阈值 {INDEPENDENT_THRESHOLD}%，窗口 {INDEPENDENT_LOOKBACK} 分钟")
+    print(f"波动扫描: {'开启' if VOLATILITY_SCAN_ENABLED else '关闭'}，阈值 {VOLATILITY_THRESHOLD}%")
+    print(f"独立行情: {'开启' if INDEPENDENT_MODE_ENABLED else '关闭'}，阈值 {INDEPENDENT_THRESHOLD}%")
 
     # 启动所有后台线程
     threading.Thread(target=verify_loop, daemon=True).start()
