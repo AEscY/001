@@ -10,7 +10,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==================== 版本信息 ====================
-VERSION = "1.9.1"  # 修复语法错误和弃用警告
+VERSION = "1.9.2"  # 修复：Bot 移至主线程，Flask 移至子线程
 
 # ==================== 配置区 ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -1628,7 +1628,7 @@ def health():
 
 def run_http():
     port = int(os.environ.get("PORT", 10000))
-    print(f"🌐 HTTP 心跳服务正在主线程启动，端口: {port}...")
+    print(f"🌐 HTTP 心跳服务正在启动，端口: {port}...")
     flask_app.run(host='0.0.0.0', port=port, debug=False)
 
 # ==================== 启动通知 ====================
@@ -1646,13 +1646,14 @@ def send_startup_notification():
     )
     send_telegram(msg)
 
-# ==================== 主程序 ====================
+# ==================== 主程序（修复：Bot在主线程，Flask在子线程） ====================
 if __name__ == "__main__":
     print(f"🚀 合约胜率增强版 v{VERSION} 启动于 {datetime.now(timezone.utc)}")
     print(f"初始监控: {BTC_SYMBOL} + {', '.join(DEFAULT_ALT_SYMBOLS)}")
     print(f"基础 Z-Score 阈值: 多 {ZSCORE_BASE_LONG} / 空 {ZSCORE_BASE_SHORT}")
     print(f"自动过滤: 保留前 {MAX_COINS} 名")
 
+    # ---- 所有后台线程（验证、扫描、WebSocket等） ----
     threading.Thread(target=verify_loop, daemon=True).start()
     threading.Thread(target=auto_scan_new_coins, daemon=True).start()
     threading.Thread(target=auto_filter_coins, daemon=True).start()
@@ -1660,10 +1661,13 @@ if __name__ == "__main__":
     threading.Thread(target=independent_scanner, daemon=True).start()
     threading.Thread(target=start_ws, daemon=True).start()
 
-    print("🤖 正在后台线程启动 Telegram Bot...")
-    bot_thread = threading.Thread(target=run_telegram_bot, daemon=True)
-    bot_thread.start()
+    # ---- Flask 放在子线程（避免阻塞主线程） ----
+    http_thread = threading.Thread(target=run_http, daemon=True)
+    http_thread.start()
 
+    # ---- 启动通知放在子线程 ----
     threading.Thread(target=send_startup_notification, daemon=True).start()
 
-    run_http()
+    # ---- Telegram Bot 放在主线程（解决信号处理器冲突） ----
+    print("🤖 正在主线程启动 Telegram Bot...")
+    run_telegram_bot()
