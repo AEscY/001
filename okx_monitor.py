@@ -30,14 +30,22 @@ ALERT_COOLDOWN = 120
 SUMMARY_MIN_DIFF = 0.3
 
 # ==================== 验证配置 ====================
-VERIFY_MINUTES = 15                      # 验证等待时间（分钟）
-VERIFY_PRICE_CHANGE_PCT = 0.8            # 验证成功所需的最小价格变动百分比（%）
-PENDING_SIGNALS = []                     # 存储待验证的信号
+VERIFY_MINUTES = 15
+VERIFY_PRICE_CHANGE_PCT = 0.8
+PENDING_SIGNALS = []
 PENDING_LOCK = threading.Lock()
-
-# 验证统计（近24小时）
 VERIFY_STATS = {"total": 0, "success": 0, "failed": 0, "expired": 0}
 STATS_LOCK = threading.Lock()
+
+# ==================== 自动过滤配置 ====================
+AUTO_FILTER_ENABLED = True
+MAX_COINS = 150
+FILTER_INTERVAL = 1800
+
+# ==================== 波动扫描配置 ====================
+VOLATILITY_SCAN_ENABLED = True
+VOLATILITY_THRESHOLD = 3.0              # 波动阈值（%），可通过 /setvolatility 命令动态调整
+VOLATILITY_SCAN_INTERVAL = 60           # 扫描间隔（秒），默认1分钟
 
 # ==================== 全局状态 ====================
 alt_symbols = set(DEFAULT_ALT_SYMBOLS)
@@ -56,26 +64,22 @@ auto_refresh_timer = None
 
 # ==================== 菜单键盘 ====================
 def get_main_keyboard():
-    """生成主菜单键盘（常驻）"""
     buttons = [
         [KeyboardButton("/status"), KeyboardButton("/summary")],
         [KeyboardButton("/autorefresh on"), KeyboardButton("/autorefresh off")],
         [KeyboardButton("/addcoin"), KeyboardButton("/addtop")],
         [KeyboardButton("/removecoin"), KeyboardButton("/clear")],
-        [KeyboardButton("/help")]
+        [KeyboardButton("/setvolatility"), KeyboardButton("/help")]
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
 
 # ==================== 推送函数 ====================
 def send_telegram(msg):
-    if TELEGRAM_TOKEN == "你的Bot Token":
-        print(msg)
-        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=5)
     except:
-        pass
+        print(f"推送失败: {msg}")
 
 # ==================== 1. RSI 计算 ====================
 def calculate_rsi(symbol, interval="15m", limit=50):
@@ -268,7 +272,7 @@ def verify_loop():
                             change_pct = (current_price - signal["price"]) / signal["price"] * 100
                             if change_pct > VERIFY_PRICE_CHANGE_PCT:
                                 success = True
-                        else:  # SHORT
+                        else:
                             change_pct = (signal["price"] - current_price) / signal["price"] * 100
                             if change_pct > VERIFY_PRICE_CHANGE_PCT:
                                 success = True
@@ -447,7 +451,97 @@ def auto_scan_new_coins():
             print(f"自动扫描出错: {e}")
         time.sleep(3600)
 
-# ==================== 8. 汇总 ====================
+# ==================== 8. 自动过滤小币种 ====================
+def auto_filter_coins():
+    global alt_symbols, price_data
+    while True:
+        time.sleep(FILTER_INTERVAL)
+        if not AUTO_FILTER_ENABLED:
+            continue
+        try:
+            resp = requests.get("https://www.okx.com/api/v5/market/tickers?instType=SPOT", timeout=10)
+            data = resp.json()
+            if data["code"] != "0":
+                continue
+            tickers = data["data"]
+            usdt_tickers = [t for t in tickers if t["instId"].endswith("-USDT") and t["instId"] != BTC_SYMBOL]
+            sorted_tickers = sorted(usdt_tickers, key=lambda x: float(x.get("vol24h", 0)), reverse=True)
+            top_symbols = [t["instId"] for t in sorted_tickers[:MAX_COINS]]
+            
+            current_set = set(alt_symbols)
+            target_set = set(top_symbols)
+            to_add = target_set - current_set
+            to_remove = current_set - target_set - {BTC_SYMBOL}
+            
+            if to_add or to_remove:
+                for sym in to_remove:
+                    alt_symbols.remove(sym)
+                    price_data.pop(sym, None)
+                for sym in to_add:
+                    alt_symbols.add(sym)
+                    price_data[sym] = {"price": 0, "change": 0, "volume": 0}
+                
+                restart_websocket()
+                msg = (
+                    f"🔄 自动过滤已更新监控列表\n"
+                    f"保留交易量前 {MAX_COINS} 的币种\n"
+                    f"添加: {', '.join(list(to_add)[:5])}" + ("..." if len(to_add)>5 else "") + "\n"
+                    f"移除: {', '.join(list(to_remove)[:5])}" + ("..." if len(to_remove)>5 else "")
+                )
+                send_telegram(msg)
+        except Exception as e:
+            print(f"自动过滤出错: {e}")
+
+# ==================== 9. 波动扫描 ====================
+def volatility_scanner():
+    """波动扫描：捕捉小币种突发暴涨暴跌"""
+    cache = {}
+    while True:
+        time.sleep(VOLATILITY_SCAN_INTERVAL)
+        if not VOLATILITY_SCAN_ENABLED:
+            continue
+        try:
+            resp = requests.get("https://www.okx.com/api/v5/market/tickers?instType=SPOT", timeout=10)
+            data = resp.json()
+            if data["code"] != "0":
+                continue
+            
+            alerts = []
+            for item in data["data"]:
+                symbol = item["instId"]
+                if not symbol.endswith("-USDT") or symbol == BTC_SYMBOL:
+                    continue
+                
+                current_price = float(item["last"])
+                if symbol in alt_symbols:
+                    continue
+                
+                if symbol in cache:
+                    prev_price = cache[symbol]
+                    price_change_pct = (current_price - prev_price) / prev_price * 100
+                    if abs(price_change_pct) >= VOLATILITY_THRESHOLD:
+                        alerts.append({
+                            'symbol': symbol,
+                            'price': current_price,
+                            'change': price_change_pct,
+                            'type': '🚀 暴涨' if price_change_pct > 0 else '💥 暴跌'
+                        })
+                        if symbol not in alt_symbols:
+                            alt_symbols.add(symbol)
+                            price_data[symbol] = {"price": current_price, "change": 0, "volume": 0}
+                cache[symbol] = current_price
+            
+            if alerts:
+                msg = "🚨 **突发异动警报（小币种）**\n"
+                for a in alerts[:5]:
+                    msg += f"{a['symbol']} {a['type']} {a['change']:+.2f}% | 现价: ${a['price']:.4f}\n"
+                msg += "\n✅ 已自动加入监控列表，将持续追踪。"
+                send_telegram(msg)
+                restart_websocket()
+        except Exception as e:
+            print(f"波动扫描出错: {e}")
+
+# ==================== 10. 汇总 ====================
 def generate_summary():
     btc = price_data[BTC_SYMBOL]
     btc_change = btc["change"]
@@ -483,7 +577,7 @@ def generate_summary():
         lines.append(f"\n⚪ 中性（背离≤±{SUMMARY_MIN_DIFF}%）: {len(neutral)} 个")
     return header + "\n".join(lines)
 
-# ==================== 9. 自动刷新 ====================
+# ==================== 11. 自动刷新 ====================
 def auto_refresh_job():
     global auto_refresh_timer
     if auto_refresh_enabled:
@@ -509,12 +603,12 @@ def stop_auto_refresh():
         auto_refresh_timer.cancel()
         auto_refresh_timer = None
 
-# ==================== 10. Telegram命令（含键盘） ====================
+# ==================== 12. Telegram命令 ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
         return
     await update.message.reply_text(
-        "🤖 合约胜率增强Bot (含验证阈值)\n"
+        "🤖 合约胜率增强Bot (含验证阈值 + 自动过滤 + 波动扫描)\n"
         "点击下方按钮快速输入命令，再补充参数即可。\n\n"
         "命令说明：\n"
         "/status - 查看监控状态 + 验证统计\n"
@@ -526,6 +620,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/addtop <数量> - 添加交易量前N\n"
         "/removecoin <币种> - 移除\n"
         "/clear - 清空所有山寨币\n"
+        "/setvolatility <数值> - 设置波动扫描阈值(0.5~20%)\n"
         "/help - 此帮助",
         reply_markup=get_main_keyboard()
     )
@@ -548,10 +643,14 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         expired = VERIFY_STATS["expired"]
         success_rate = f"{success/total*100:.1f}%" if total > 0 else "N/A"
 
+    filter_status = "🟢 开启" if AUTO_FILTER_ENABLED else "🔴 关闭"
+    volatility_status = "🟢 开启" if VOLATILITY_SCAN_ENABLED else "🔴 关闭"
     msg = (
         f"📋 监控: {count} 个山寨币\n"
         f"自动刷新: {status_auto}"
         f"{f' (间隔 {interval_min} 分钟)' if auto_refresh_enabled else ''}\n"
+        f"自动过滤: {filter_status} (保留前 {MAX_COINS} 名)\n"
+        f"波动扫描: {volatility_status} (阈值 {VOLATILITY_THRESHOLD}%)\n"
         f"待验证信号: {pending_count} 个\n"
         f"📊 近24小时验证统计:\n"
         f"  总数: {total} | ✅成功: {success} | ❌失败: {failed} | ⏳失效: {expired}\n"
@@ -658,7 +757,35 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("⚠️ 列表已空", reply_markup=get_main_keyboard())
 
-# ==================== 11. Telegram Bot（主线程） ====================
+# ==================== 新增：动态调整波动阈值命令 ====================
+async def setvolatility(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """设置波动扫描阈值（百分比）"""
+    global VOLATILITY_THRESHOLD
+    if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            f"📊 当前波动扫描阈值: {VOLATILITY_THRESHOLD}%\n"
+            "用法: /setvolatility <数值>（如 /setvolatility 3.5）\n"
+            "建议：保守型 5%，激进型 2%，主流币 2-3%，小币种 4-5%",
+            reply_markup=get_main_keyboard()
+        )
+        return
+    try:
+        new_threshold = float(context.args[0])
+        if new_threshold < 0.5 or new_threshold > 20:
+            await update.message.reply_text("⚠️ 阈值范围应在 0.5% ~ 20% 之间", reply_markup=get_main_keyboard())
+            return
+        VOLATILITY_THRESHOLD = new_threshold
+        await update.message.reply_text(
+            f"✅ 波动扫描阈值已更新为 {VOLATILITY_THRESHOLD}%\n"
+            f"建议：保守型 5%，激进型 2%，主流币 2-3%，小币种 4-5%",
+            reply_markup=get_main_keyboard()
+        )
+    except ValueError:
+        await update.message.reply_text("⚠️ 请输入有效的数字，如 /setvolatility 3.5", reply_markup=get_main_keyboard())
+
+# ==================== 13. Telegram Bot ====================
 def run_telegram_bot():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -670,10 +797,11 @@ def run_telegram_bot():
     app.add_handler(CommandHandler("addtop", addtop))
     app.add_handler(CommandHandler("removecoin", removecoin))
     app.add_handler(CommandHandler("clear", clear))
+    app.add_handler(CommandHandler("setvolatility", setvolatility))  # 注册新命令
     print("🤖 Telegram Bot 正在运行 (主线程)")
     app.run_polling()
 
-# ==================== 12. Flask心跳（子线程） ====================
+# ==================== 14. Flask心跳 ====================
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -683,22 +811,26 @@ def health():
 def run_http():
     flask_app.run(host='0.0.0.0', port=10000)
 
-# ==================== 13. 主程序 ====================
+# ==================== 15. 主程序 ====================
 if __name__ == "__main__":
-    print(f"🚀 合约胜率增强版 (含验证阈值) 启动于 {datetime.now()}")
+    print(f"🚀 合约胜率增强版 (含验证阈值 + 自动过滤 + 波动扫描) 启动于 {datetime.now()}")
     print(f"初始监控: {BTC_SYMBOL} + {', '.join(DEFAULT_ALT_SYMBOLS)}")
     print(f"验证阈值: {VERIFY_PRICE_CHANGE_PCT}% | 等待时间: {VERIFY_MINUTES}分钟")
+    print(f"自动过滤: {'开启' if AUTO_FILTER_ENABLED else '关闭'}，保留前 {MAX_COINS} 名，间隔 {FILTER_INTERVAL//60} 分钟")
+    print(f"波动扫描: {'开启' if VOLATILITY_SCAN_ENABLED else '关闭'}，阈值 {VOLATILITY_THRESHOLD}%，间隔 {VOLATILITY_SCAN_INTERVAL} 秒")
 
-    # 启动后台线程（验证、扫描、WebSocket）
+    # 启动所有后台线程
     threading.Thread(target=verify_loop, daemon=True).start()
     threading.Thread(target=auto_scan_new_coins, daemon=True).start()
+    threading.Thread(target=auto_filter_coins, daemon=True).start()
+    threading.Thread(target=volatility_scanner, daemon=True).start()
     threading.Thread(target=start_ws, daemon=True).start()
 
-    # Flask HTTP 放在子线程
+    # Flask 子线程
     http_thread = threading.Thread(target=run_http, daemon=True)
     http_thread.start()
     print("🌐 HTTP 心跳服务已启动 (子线程)")
 
-    # 主线程运行 Telegram Bot（避免信号冲突）
+    # 主线程运行 Telegram Bot
     print("🤖 正在主线程启动 Telegram Bot...")
     run_telegram_bot()
