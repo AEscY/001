@@ -1,0 +1,4 @@
+requests>=2.25.0
+websocket-client>=1.5.0
+Flask>=2.0.0
+python-telegram-bot>=20.0
