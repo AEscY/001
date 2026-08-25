@@ -529,12 +529,15 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
             else:
                 return None, 0, ""
         else:
-            if zscore > ZSCORE_LONG_THRESHOLD:
-                signal_type = "LONG"
-            elif zscore < ZSCORE_SHORT_THRESHOLD:
-                signal_type = "SHORT"
-            else:
-                return None, 0, ""
+           # 使用动态阈值
+long_threshold = get_dynamic_zscore_threshold(symbol, "LONG")
+short_threshold = get_dynamic_zscore_threshold(symbol, "SHORT")
+if zscore > long_threshold:
+    signal_type = "LONG"
+elif zscore < short_threshold:
+    signal_type = "SHORT"
+else:
+    return None, 0, ""
 
     details = []
     score = 0
