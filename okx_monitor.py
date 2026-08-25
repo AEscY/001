@@ -10,7 +10,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==================== 版本信息 ====================
-VERSION = "1.5.3"  # 修复：从 open24h 和 last 计算涨跌幅
+VERSION = "1.5.3"  # 统一使用滚动24h涨跌幅 (基于open24h)
 
 # ==================== 配置区（从环境变量读取） ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -344,7 +344,7 @@ def verify_loop():
             for idx in sorted(to_remove, reverse=True):
                 PENDING_SIGNALS.pop(idx)
 
-# ==================== 7. WebSocket（修复：计算涨跌幅） ====================
+# ==================== 7. WebSocket（统一使用滚动24h涨跌幅） ====================
 def restart_websocket():
     global ws_instance, restart_flag
     with ws_lock:
@@ -364,12 +364,12 @@ def on_message(ws, message):
                 continue
             last = float(item.get("last", 0))
             open24h = float(item.get("open24h", 0))
-            # 计算涨跌幅
+            # 统一使用滚动24h涨跌幅
             if open24h != 0:
                 change = (last - open24h) / open24h * 100
             else:
                 change = 0.0
-            volume = float(item.get("volCcy24h", 0))  # 用成交额
+            volume = float(item.get("volCcy24h", 0))  # USDT成交额
             price_data[inst_id]["price"] = last
             price_data[inst_id]["change"] = change
             price_data[inst_id]["volume"] = volume
@@ -636,7 +636,7 @@ def independent_scanner():
                 if abs(price_change) >= INDEPENDENT_THRESHOLD:
                     rsi = calculate_rsi(symbol)
                     funding = get_funding_rate(symbol)
-                    volume = float(item.get("vol24h", 0))
+                    volume = float(item.get("volCcy24h", 0))
                     
                     alt_change = price_change
                     signal_type = "LONG" if alt_change > 0 else "SHORT"
