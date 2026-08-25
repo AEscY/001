@@ -1629,7 +1629,7 @@ if __name__ == "__main__":
     print(f"基础 Z-Score 阈值: 多 {ZSCORE_BASE_LONG} / 空 {ZSCORE_BASE_SHORT}")
     print(f"自动过滤: 保留前 {MAX_COINS} 名")
 
-    # 启动所有后台线程（验证、扫描、WebSocket等）
+    # 启动所有后台线程
     threading.Thread(target=verify_loop, daemon=True).start()
     threading.Thread(target=auto_scan_new_coins, daemon=True).start()
     threading.Thread(target=auto_filter_coins, daemon=True).start()
@@ -1637,13 +1637,13 @@ if __name__ == "__main__":
     threading.Thread(target=independent_scanner, daemon=True).start()
     threading.Thread(target=start_ws, daemon=True).start()
 
-    # ---- 将 Telegram Bot 放在后台线程 ----
+    # 后台启动 Telegram Bot
     print("🤖 正在后台线程启动 Telegram Bot...")
     bot_thread = threading.Thread(target=run_telegram_bot, daemon=True)
     bot_thread.start()
 
-    # ---- 主线程运行 Flask HTTP 服务（确保端口被监听） ----
-    print(f"🌐 HTTP 心跳服务正在主线程启动，端口: {port}...")
+    # 主线程启动 Flask（先定义 port）
     import os
     port = int(os.environ.get("PORT", 10000))
+    print(f"🌐 HTTP 心跳服务正在主线程启动，端口: {port}...")
     flask_app.run(host='0.0.0.0', port=port)
