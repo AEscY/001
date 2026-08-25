@@ -10,7 +10,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==================== 版本信息 ====================
-VERSION = "1.5.2"  # 增强字段解析 + 调试打印
+VERSION = "1.5.3"  # 修复：从 open24h 和 last 计算涨跌幅
 
 # ==================== 配置区（从环境变量读取） ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -89,7 +89,6 @@ def send_telegram(msg):
 
 # ==================== 1. 获取合约列表 ====================
 def get_swap_symbols():
-    """获取 OKX 所有 USDT 永续合约的标的名称（如 BTC-USDT）"""
     try:
         url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
         resp = requests.get(url, timeout=10)
@@ -345,7 +344,7 @@ def verify_loop():
             for idx in sorted(to_remove, reverse=True):
                 PENDING_SIGNALS.pop(idx)
 
-# ==================== 7. WebSocket（增强字段解析 + 调试） ====================
+# ==================== 7. WebSocket（修复：计算涨跌幅） ====================
 def restart_websocket():
     global ws_instance, restart_flag
     with ws_lock:
@@ -357,25 +356,21 @@ def restart_websocket():
 def on_message(ws, message):
     try:
         data = json.loads(message)
-        # 调试：打印第一条数据的字段名
-        if "data" in data and len(data["data"]) > 0:
-            first_item = data["data"][0]
-            if "instId" in first_item and first_item["instId"] == BTC_SYMBOL:
-                print("📦 BTC数据字段:", list(first_item.keys()))
         if "data" not in data:
             return
         for item in data["data"]:
             inst_id = item.get("instId", "")
             if inst_id not in price_data:
                 continue
-            price = float(item.get("last", 0))
-            # 尝试多个可能的字段名
-            change = float(item.get("priceChangePercent",
-                         item.get("priceChangePcnt",
-                         item.get("changeRate",
-                         item.get("priceChange", 0)))))
-            volume = float(item.get("vol24h", 0))
-            price_data[inst_id]["price"] = price
+            last = float(item.get("last", 0))
+            open24h = float(item.get("open24h", 0))
+            # 计算涨跌幅
+            if open24h != 0:
+                change = (last - open24h) / open24h * 100
+            else:
+                change = 0.0
+            volume = float(item.get("volCcy24h", 0))  # 用成交额
+            price_data[inst_id]["price"] = last
             price_data[inst_id]["change"] = change
             price_data[inst_id]["volume"] = volume
         check_divergence()
@@ -798,7 +793,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/removecoin <币种> - 移除\n"
         "/clear - 清空所有山寨币\n"
         "/setvolatility <数值> - 设置波动扫描阈值(0.5~20%)\n"
-        "/debug - 打印当前BTC数据字段(调试)\n"
+        "/debug - 打印当前BTC数据(调试)\n"
         "/help - 此帮助",
         reply_markup=get_main_keyboard()
     )
@@ -963,13 +958,16 @@ async def setvolatility(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("⚠️ 请输入有效的数字，如 /setvolatility 3.5", reply_markup=get_main_keyboard())
 
-# ==================== 新增调试命令 ====================
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
         return
     btc = price_data.get(BTC_SYMBOL)
     if btc:
-        msg = f"🔍 **BTC 当前数据**\n价格: ${btc['price']:.2f}\n24h涨跌幅: {btc['change']:.2f}%\n成交量: {btc['volume']:.0f}\n\n请检查Render日志中打印的字段名。"
+        msg = (f"🔍 **BTC 当前数据**\n"
+               f"价格: ${btc['price']:.2f}\n"
+               f"24h涨跌幅: {btc['change']:.2f}%\n"
+               f"成交额: ${btc['volume']:.0f}\n"
+               f"监控币种总数: {len(alt_symbols)}")
     else:
         msg = "❌ 未获取到BTC数据"
     await update.message.reply_text(msg, reply_markup=get_main_keyboard())
@@ -987,7 +985,7 @@ def run_telegram_bot():
     app.add_handler(CommandHandler("removecoin", removecoin))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("setvolatility", setvolatility))
-    app.add_handler(CommandHandler("debug", debug))  # 新增
+    app.add_handler(CommandHandler("debug", debug))
     print("🤖 Telegram Bot 正在运行 (主线程)")
     app.run_polling()
 
