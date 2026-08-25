@@ -10,28 +10,21 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==================== 版本信息 ====================
-VERSION = "1.9.0"  # 自适应Z-Score阈值 + 订单簿不平衡 + 历史验证统计
-
-# ==================== 前瞻性引擎配置（v1.8.0/v1.9.0） ====================
-WHALE_VOLUME_THRESHOLD = 3.0   # 鲸鱼追踪成交量暴增倍数
-RISK_PER_TRADE = 0.02          # 单笔风险占资金比例（2%）
-ACCOUNT_BALANCE = 10000        # 默认账户资金（USDT），可自行修改
-PRICE_TRAP_THRESHOLD = 0.005   # 刺破幅度阈值（0.5%）
+VERSION = "1.9.0"
 
 # ==================== 配置区 ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-    raise ValueError("❌ 请设置环境变量 TELEGRAM_BOT_TOKEN 和 TELEGRAM_CHAT_ID")
+    print("⚠️ 警告: TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未设置，Bot将无法启动")
 
 BTC_SYMBOL = "BTC-USDT"
 DEFAULT_ALT_SYMBOLS = ["ETH-USDT", "SOL-USDT", "BNB-USDT", "ADA-USDT", "DOGE-USDT", "XRP-USDT"]
 
-# 基础参数
 BTC_TREND_THRESHOLD = 0.3
-ZSCORE_BASE_LONG = 1.8          # 基础做多阈值（动态调整）
-ZSCORE_BASE_SHORT = -1.8        # 基础做空阈值（动态调整）
+ZSCORE_BASE_LONG = 1.8
+ZSCORE_BASE_SHORT = -1.8
 MIN_ZSCORE_SAMPLES = 20
 FALLBACK_LONG = 0.6
 FALLBACK_SHORT = -0.6
@@ -39,14 +32,17 @@ FALLBACK_SHORT = -0.6
 RSI_OVERBOUGHT = 70
 RSI_OVERSOLD = 30
 VOLUME_THRESHOLD = 1000000
-
 ALERT_COOLDOWN = 120
 SUMMARY_MIN_DIFF = 0.3
 
-# ==================== 自适应阈值配置（v1.9.0 新增） ====================
-ATR_ADJUST_FACTOR = 0.5        # ATR比率调整因子 (0~1)
-ZSCORE_MIN = 1.0                # 最低阈值
-ZSCORE_MAX = 2.5                # 最高阈值
+# ==================== v1.9.0 新增配置 ====================
+ATR_ADJUST_FACTOR = 0.5
+ZSCORE_MIN = 1.0
+ZSCORE_MAX = 2.5
+WHALE_VOLUME_THRESHOLD = 3.0
+RISK_PER_TRADE = 0.02
+ACCOUNT_BALANCE = 10000
+PRICE_TRAP_THRESHOLD = 0.005
 
 # ==================== 验证配置 ====================
 VERIFY_MINUTES = 15
@@ -54,20 +50,20 @@ VERIFY_PRICE_CHANGE_PCT = 0.8
 PENDING_SIGNALS = []
 PENDING_LOCK = threading.Lock()
 VERIFY_STATS = {"total": 0, "success": 0, "failed": 0, "expired": 0}
-SIGNAL_HISTORY = []  # v1.9.0 新增：存储最近50个信号的评分和验证结果
+SIGNAL_HISTORY = []
 STATS_LOCK = threading.Lock()
 
-# ==================== 自动过滤配置 ====================
+# ==================== 自动过滤 ====================
 AUTO_FILTER_ENABLED = True
 MAX_COINS = 200
 FILTER_INTERVAL = 1800
 
-# ==================== 波动扫描配置 ====================
+# ==================== 波动扫描 ====================
 VOLATILITY_SCAN_ENABLED = True
 VOLATILITY_THRESHOLD = 3.0
 VOLATILITY_SCAN_INTERVAL = 60
 
-# ==================== 独立行情监控配置 ====================
+# ==================== 独立行情 ====================
 INDEPENDENT_MODE_ENABLED = True
 INDEPENDENT_THRESHOLD = 3.0
 INDEPENDENT_LOOKBACK = 15
@@ -87,7 +83,6 @@ restart_flag = False
 auto_refresh_enabled = False
 auto_refresh_interval = 300
 auto_refresh_timer = None
-
 price_candle_cache = {}
 
 # ==================== 菜单键盘 ====================
@@ -105,6 +100,9 @@ def get_main_keyboard():
 
 # ==================== 推送函数 ====================
 def send_telegram(msg, parse_mode=None):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print(f"⚠️ Token或ChatID未配置，无法发送: {msg[:50]}...")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
@@ -207,7 +205,6 @@ def get_atr_percent(symbol, period=14):
     except:
         return 0.5
 
-# ==================== 全面感知引擎（v1.8.0 保留） ====================
 def get_market_sentiment():
     try:
         main_coins = ["BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT"]
@@ -219,7 +216,7 @@ def get_market_sentiment():
             data = resp.json()
             if data["code"] == "0" and data["data"]:
                 changes.append(float(data["data"][0]["priceChangePercent"]))
-                volumes.append(float(data["data"][0]["volCcy24h"]))
+                volumes.append(float(data["data"][0vol]["Ccy24h"]))
         if not changes:
             return 50
         avg_change = sum(changes) / len(changes)
@@ -385,10 +382,8 @@ def get_premium(symbol):
     except:
         return 0.0
 
-# ---- Part 1 结束，请继续复制 Part 2 ----
-# ==================== v1.9.0 新增函数 ====================
+# ==================== v1.9.0 核心函数 ====================
 def get_dynamic_zscore_threshold(symbol, direction):
-    """根据ATR比率动态计算Z-Score阈值"""
     atr_ratio = get_atr_ratio(symbol)
     if direction == "LONG":
         base = ZSCORE_BASE_LONG
@@ -401,7 +396,6 @@ def get_dynamic_zscore_threshold(symbol, direction):
         return -min(max(dynamic, ZSCORE_MIN), ZSCORE_MAX)
 
 def get_orderbook_imbalance(symbol):
-    """计算订单簿不平衡评分 (-15 ~ +15)"""
     try:
         url = f"https://www.okx.com/api/v5/market/books?instId={symbol}&sz=10"
         resp = requests.get(url, timeout=3)
@@ -421,7 +415,6 @@ def get_orderbook_imbalance(symbol):
         return 0
 
 def update_signal_history(score, success):
-    """记录信号验证结果，最多50条"""
     global SIGNAL_HISTORY
     with STATS_LOCK:
         SIGNAL_HISTORY.append({"score": score, "success": success})
@@ -429,7 +422,6 @@ def update_signal_history(score, success):
             SIGNAL_HISTORY.pop(0)
 
 def get_whale_score(symbol):
-    """成交量异动评分 (0~15)"""
     try:
         url = f"https://www.okx.com/api/v5/market/history-candles?instId={symbol}&bar=1m&limit=20"
         resp = requests.get(url, timeout=3)
@@ -516,7 +508,7 @@ def get_rsi_entry_advice(symbol, signal_type):
         else:
             return "RSI超卖，建议等待反弹再入场"
 
-# ==================== Z-Score 历史管理 ====================
+# ==================== Z-Score 管理 ====================
 def update_diff_history(symbol, current_diff, max_len=100):
     if symbol not in diff_history:
         diff_history[symbol] = []
@@ -536,7 +528,7 @@ def get_zscore(symbol, current_diff):
         return 0
     return (current_diff - mean) / std
 
-# ==================== 核心评分函数（v1.9.0 完整版） ====================
+# ==================== 核心评分 ====================
 def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, use_independent=False):
     if use_independent:
         if alt_change > 0:
@@ -557,7 +549,6 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
             else:
                 return None, 0, ""
         else:
-            # v1.9.0 动态阈值
             long_threshold = get_dynamic_zscore_threshold(symbol, "LONG")
             short_threshold = get_dynamic_zscore_threshold(symbol, "SHORT")
             if zscore > long_threshold:
@@ -570,7 +561,6 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
     details = []
     score = 0
 
-    # ---- 基础分 ----
     if use_independent:
         base_score = min(50, 30 + abs(alt_change) * 8)
         details.append(f"独立波动 {alt_change:+.2f}% (基础分{base_score:.0f})")
@@ -579,107 +569,128 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
         details.append(f"背离差 {diff:+.2f}% (基础分{base_score:.0f})")
     score += base_score
 
-    # ---- EMA50 趋势过滤 ----
     ema50 = get_ema(symbol)
     if ema50 > 0:
         if signal_type == "LONG":
             if current_price > ema50 * 1.02:
-                score += 15; details.append("站上EMA50 (+15)")
+                score += 15
+                details.append("站上EMA50 (+15)")
             elif current_price < ema50 * 0.98:
-                score -= 20; details.append("跌破EMA50 (-20)")
+                score -= 20
+                details.append("跌破EMA50 (-20)")
             else:
                 details.append("EMA50附近")
         else:
             if current_price < ema50 * 0.98:
-                score += 15; details.append("跌破EMA50 (+15)")
+                score += 15
+                details.append("跌破EMA50 (+15)")
             elif current_price > ema50 * 1.02:
-                score -= 20; details.append("站上EMA50 (-20)")
+                score -= 20
+                details.append("站上EMA50 (-20)")
             else:
                 details.append("EMA50附近")
 
-    # ---- RSI ----
     rsi = calculate_rsi(symbol)
     if signal_type == "LONG":
         if rsi > RSI_OVERBOUGHT:
-            score -= 30; details.append(f"RSI={rsi:.0f}超买 (-30)")
+            score -= 30
+            details.append(f"RSI={rsi:.0f}超买 (-30)")
         elif rsi < RSI_OVERSOLD:
-            score += 20; details.append(f"RSI={rsi:.0f}低位反弹 (+20)")
+            score += 20
+            details.append(f"RSI={rsi:.0f}低位反弹 (+20)")
         else:
             details.append(f"RSI={rsi:.0f}中性")
     else:
         if rsi < RSI_OVERSOLD:
-            score -= 30; details.append(f"RSI={rsi:.0f}超卖 (-30)")
+            score -= 30
+            details.append(f"RSI={rsi:.0f}超卖 (-30)")
         elif rsi > RSI_OVERBOUGHT:
-            score += 20; details.append(f"RSI={rsi:.0f}高位回落 (+20)")
+            score += 20
+            details.append(f"RSI={rsi:.0f}高位回落 (+20)")
         else:
             details.append(f"RSI={rsi:.0f}中性")
 
-    # ---- 资金费率 ----
     funding = get_funding_rate(symbol)
     if signal_type == "LONG":
         if funding > 0.01:
-            score -= 20; details.append(f"费率{funding*100:.3f}%过高 (-20)")
+            score -= 20
+            details.append(f"费率{funding*100:.3f}%过高 (-20)")
         elif funding < -0.005:
-            score += 15; details.append(f"费率{funding*100:.3f}%空头拥挤 (+15)")
+            score += 15
+            details.append(f"费率{funding*100:.3f}%空头拥挤 (+15)")
         else:
             details.append(f"费率{funding*100:.3f}%中性")
     else:
         if funding < -0.01:
-            score -= 20; details.append(f"费率{funding*100:.3f}%过低 (-20)")
+            score -= 20
+            details.append(f"费率{funding*100:.3f}%过低 (-20)")
         elif funding > 0.005:
-            score += 15; details.append(f"费率{funding*100:.3f}%多头拥挤 (+15)")
+            score += 15
+            details.append(f"费率{funding*100:.3f}%多头拥挤 (+15)")
         else:
             details.append(f"费率{funding*100:.3f}%中性")
 
-    # ---- 成交量 ----
     if volume > VOLUME_THRESHOLD:
-        score += 10; details.append(f"成交额${volume/1000000:.1f}M (+10)")
+        score += 10
+        details.append(f"成交额${volume/1000000:.1f}M (+10)")
     else:
         details.append(f"成交额${volume/1000000:.1f}M (一般)")
 
-    # ---- Z-Score 显著性 ----
     if not use_independent and abs(btc_change) >= BTC_TREND_THRESHOLD:
         z = get_zscore(symbol, diff)
         if z is not None:
             if z > 2.5:
-                score += 15; details.append(f"Z-Score={z:.2f} 极强 (+15)")
+                score += 15
+                details.append(f"Z-Score={z:.2f} 极强 (+15)")
             elif z > 2.0:
-                score += 10; details.append(f"Z-Score={z:.2f} 强 (+10)")
+                score += 10
+                details.append(f"Z-Score={z:.2f} 强 (+10)")
             elif z > 1.8:
-                score += 5; details.append(f"Z-Score={z:.2f} (+5)")
+                score += 5
+                details.append(f"Z-Score={z:.2f} (+5)")
             elif z < -2.5:
-                score += 15; details.append(f"Z-Score={z:.2f} 极弱 (+15)")
+                score += 15
+                details.append(f"Z-Score={z:.2f} 极弱 (+15)")
             elif z < -2.0:
-                score += 10; details.append(f"Z-Score={z:.2f} 弱 (+10)")
+                score += 10
+                details.append(f"Z-Score={z:.2f} 弱 (+10)")
             elif z < -1.8:
-                score += 5; details.append(f"Z-Score={z:.2f} (+5)")
+                score += 5
+                details.append(f"Z-Score={z:.2f} (+5)")
 
-    # ========== 全面感知因子（v1.8.0） ==========
     sentiment = get_market_sentiment()
     if sentiment < 30:
         if signal_type == "LONG":
-            score += 20; details.append(f"市场恐惧({sentiment}) +20")
+            score += 20
+            details.append(f"市场恐惧({sentiment}) +20")
         else:
-            score -= 15; details.append(f"市场恐惧({sentiment}) 做空-15")
+            score -= 15
+            details.append(f"市场恐惧({sentiment}) 做空-15")
     elif sentiment > 70:
         if signal_type == "SHORT":
-            score += 20; details.append(f"市场贪婪({sentiment}) +20")
+            score += 20
+            details.append(f"市场贪婪({sentiment}) +20")
         else:
-            score -= 15; details.append(f"市场贪婪({sentiment}) 做多-15")
+            score -= 15
+            details.append(f"市场贪婪({sentiment}) 做多-15")
     else:
         details.append(f"市场情绪中性({sentiment})")
 
     sector_strength = get_sector_strength(symbol)
     if sector_strength > 1.5:
         if signal_type == "LONG":
-            score += 10; details.append(f"板块强势({sector_strength:.1f}%) +10")
+            score += 10
+            details.append(f"板块强势({sector_strength:.1f}%) +10")
         else:
-            score -= 10; details.append(f"板块强势 做空-10")
+            score -= 10
+            details.append(f"板块强势 做空-10")
     elif sector_strength < -1.5:
         if signal_type == "SHORT":
-            score += 10; details.append(f"板块弱势({sector_strength:.1f}%) +10")
+            score += 10
+            details.append(f"板块弱势({sector_strength:.1f}%) +10")
         else:
-            score -= 10; details.append(f"板块弱势 做多-10")
+            score -= 10
+            details.append(f"板块弱势 做多-10")
     else:
         details.append(f"板块中性({sector_strength:.1f}%)")
 
@@ -692,49 +703,59 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
 
     ratio = get_bid_ask_ratio(symbol)
     if signal_type == "LONG" and ratio > 1.2:
-        score += 10; details.append(f"买盘强劲({ratio:.1f}) +10")
+        score += 10
+        details.append(f"买盘强劲({ratio:.1f}) +10")
     elif signal_type == "SHORT" and ratio < 0.8:
-        score += 10; details.append(f"卖盘强劲({ratio:.1f}) +10")
+        score += 10
+        details.append(f"卖盘强劲({ratio:.1f}) +10")
     else:
         details.append(f"盘口中性({ratio:.1f})")
 
     atr_ratio = get_atr_ratio(symbol)
     if atr_ratio > 1.3:
-        score += 10; details.append(f"趋势市 (ATR×{atr_ratio:.1f}) +10")
+        score += 10
+        details.append(f"趋势市 (ATR×{atr_ratio:.1f}) +10")
     elif atr_ratio < 0.8:
-        score -= 15; details.append(f"震荡市 (ATR×{atr_ratio:.1f}) -15")
+        score -= 15
+        details.append(f"震荡市 (ATR×{atr_ratio:.1f}) -15")
     else:
         details.append(f"正常波动 (ATR×{atr_ratio:.1f})")
 
     position = get_price_position(symbol, current_price)
     if signal_type == "LONG":
         if position > 0.85:
-            score -= 15; details.append(f"价格高位 ({position:.0%}) -15")
+            score -= 15
+            details.append(f"价格高位 ({position:.0%}) -15")
         elif position < 0.3:
-            score += 10; details.append(f"价格低位 ({position:.0%}) +10")
+            score += 10
+            details.append(f"价格低位 ({position:.0%}) +10")
         else:
             details.append(f"价格中位 ({position:.0%})")
     else:
         if position < 0.15:
-            score -= 15; details.append(f"价格低位 ({position:.0%}) -15")
+            score -= 15
+            details.append(f"价格低位 ({position:.0%}) -15")
         elif position > 0.7:
-            score += 10; details.append(f"价格高位 ({position:.0%}) +10")
+            score += 10
+            details.append(f"价格高位 ({position:.0%}) +10")
         else:
             details.append(f"价格中位 ({position:.0%})")
 
     premium = get_premium(symbol)
     if signal_type == "LONG":
         if premium > 0.05:
-            score -= 20; details.append(f"基差{premium:+.2f}%多头拥挤 -20")
+            score -= 20
+            details.append(f"基差{premium:+.2f}%多头拥挤 -20")
         else:
             details.append(f"基差{premium:+.2f}%正常")
     else:
         if premium < -0.05:
-            score -= 20; details.append(f"基差{premium:+.2f}%空头拥挤 -20")
+            score -= 20
+            details.append(f"基差{premium:+.2f}%空头拥挤 -20")
         else:
             details.append(f"基差{premium:+.2f}%正常")
 
-    # ========== v1.9.0 新增订单簿不平衡 ==========
+    # v1.9.0 订单簿不平衡
     imbalance = get_orderbook_imbalance(symbol)
     if signal_type == "LONG" and imbalance > 0:
         score += min(imbalance, 15)
@@ -745,7 +766,6 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
     else:
         details.append(f"挂单中性 ({imbalance:+d})")
 
-    # ---- 前瞻性因子（v1.8.0） ----
     whale = get_whale_score(symbol)
     if whale > 0:
         score += whale
@@ -764,7 +784,6 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
     entry_advice = get_rsi_entry_advice(symbol, signal_type)
     details.append(f"入场建议：{entry_advice}")
 
-    # ---- 盈亏比 & 仓位 ----
     atr_pct = get_atr_percent(symbol)
     if signal_type == "LONG":
         sl = current_price * (1 - atr_pct * 1.5 / 100)
@@ -783,7 +802,6 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
     final_score = max(0, min(100, score))
     return signal_type, final_score, " | ".join(details)
 
-# ---- Part 2 结束，请继续复制 Part 3 ----
 # ==================== 背离检测 ====================
 def check_divergence():
     btc = price_data[BTC_SYMBOL]
@@ -847,7 +865,7 @@ def check_divergence():
                     "status": "pending"
                 })
 
-# ==================== 验证循环（含历史记录） ====================
+# ==================== 验证循环 ====================
 def verify_loop():
     while True:
         time.sleep(60)
@@ -897,7 +915,6 @@ def verify_loop():
                             with STATS_LOCK:
                                 VERIFY_STATS["total"] += 1
                                 VERIFY_STATS["success"] += 1
-                            # v1.9.0 记录历史
                             update_signal_history(signal['score'], True)
                         else:
                             signal["status"] = "failed"
@@ -917,7 +934,7 @@ def verify_loop():
             for idx in sorted(to_remove, reverse=True):
                 PENDING_SIGNALS.pop(idx)
 
-# ==================== WebSocket（分批订阅） ====================
+# ==================== WebSocket ====================
 def restart_websocket():
     global ws_instance, restart_flag
     with ws_lock:
@@ -965,12 +982,13 @@ def on_open(ws):
     all_symbols = [BTC_SYMBOL] + list(alt_symbols)
     print(f"✅ WebSocket已连接，监控 {len(all_symbols)} 个币种")
     batch_size = 50
+    total_batches = (len(all_symbols) + batch_size - 1) // batch_size
     for i in range(0, len(all_symbols), batch_size):
         batch = all_symbols[i:i+batch_size]
         args = [{"channel": "tickers", "instId": sym} for sym in batch]
         sub_msg = {"op": "subscribe", "args": args}
         ws.send(json.dumps(sub_msg))
-        print(f"📨 已发送订阅批次 {i//batch_size + 1}/{(len(all_symbols)+batch_size-1)//batch_size}，共 {len(batch)} 个币种")
+        print(f"📨 已发送订阅批次 {i//batch_size + 1}/{total_batches}，共 {len(batch)} 个币种")
         time.sleep(0.5)
 
 def start_ws():
@@ -1174,7 +1192,7 @@ def volatility_scanner():
         except Exception as e:
             print(f"波动扫描出错: {e}")
 
-# ==================== 独立行情监控 ====================
+# ==================== 独立行情 ====================
 def independent_scanner():
     cache = {}
     while True:
@@ -1304,7 +1322,7 @@ def stop_auto_refresh():
         auto_refresh_timer.cancel()
         auto_refresh_timer = None
 
-# ==================== Telegram 命令（含 v1.9.0 新增状态显示） ====================
+# ==================== Telegram 命令 ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
         return
@@ -1342,7 +1360,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         failed = VERIFY_STATS["failed"]
         expired = VERIFY_STATS["expired"]
         success_rate = f"{success/total*100:.1f}%" if total > 0 else "N/A"
-        # 计算历史验证成功率（最近50条）
         hist_total = len(SIGNAL_HISTORY)
         hist_success = sum(1 for s in SIGNAL_HISTORY if s["success"])
         hist_rate = f"{hist_success/hist_total*100:.1f}%" if hist_total > 0 else "N/A"
@@ -1350,7 +1367,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     volatility_status = "🟢 开启" if VOLATILITY_SCAN_ENABLED else "🔴 关闭"
     independent_status = "🟢 开启" if INDEPENDENT_MODE_ENABLED else "🔴 关闭"
     sentiment = get_market_sentiment()
-    # v1.9.0 动态阈值显示
     dyn_long = get_dynamic_zscore_threshold("BTC-USDT", "LONG")
     dyn_short = get_dynamic_zscore_threshold("BTC-USDT", "SHORT")
     msg = (
@@ -1377,7 +1393,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f" ... 共{count}个"
     await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
-# ==================== 其余命令（保持不变） ====================
 async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
         return
@@ -1496,8 +1511,7 @@ async def setdiff(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ZSCORE_BASE_SHORT = short_val
         await update.message.reply_text(
             f"✅ 基础 Z-Score 已更新\n"
-            f"做多: {ZSCORE_BASE_LONG} | 做空: {ZSCORE_BASE_SHORT}\n"
-            f"实际动态阈值请查看 /status",
+            f"做多: {ZSCORE_BASE_LONG} | 做空: {ZSCORE_BASE_SHORT}",
             reply_markup=get_main_keyboard()
         )
     except ValueError:
@@ -1579,25 +1593,34 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== Telegram Bot ====================
 def run_telegram_bot():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("summary", summary))
-    app.add_handler(CommandHandler("autorefresh", autorefresh))
-    app.add_handler(CommandHandler("addcoin", addcoin))
-    app.add_handler(CommandHandler("addtop", addtop))
-    app.add_handler(CommandHandler("removecoin", removecoin))
-    app.add_handler(CommandHandler("clear", clear))
-    app.add_handler(CommandHandler("setdiff", setdiff))
-    app.add_handler(CommandHandler("setvol", setvol))
-    app.add_handler(CommandHandler("setvolatility", setvolatility))
-    app.add_handler(CommandHandler("sentiment", sentiment))
-    app.add_handler(CommandHandler("debug", debug))
-    print("🤖 Telegram Bot 正在运行 (主线程)")
-    app.run_polling()
+    try:
+        print("🤖 正在尝试启动 Telegram Bot...")
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            print("❌ Token 或 Chat ID 为空，无法启动 Bot")
+            return
+        app = Application.builder().token(TELEGRAM_TOKEN).build()
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("help", help))
+        app.add_handler(CommandHandler("status", status))
+        app.add_handler(CommandHandler("summary", summary))
+        app.add_handler(CommandHandler("autorefresh", autorefresh))
+        app.add_handler(CommandHandler("addcoin", addcoin))
+        app.add_handler(CommandHandler("addtop", addtop))
+        app.add_handler(CommandHandler("removecoin", removecoin))
+        app.add_handler(CommandHandler("clear", clear))
+        app.add_handler(CommandHandler("setdiff", setdiff))
+        app.add_handler(CommandHandler("setvol", setvol))
+        app.add_handler(CommandHandler("setvolatility", setvolatility))
+        app.add_handler(CommandHandler("sentiment", sentiment))
+        app.add_handler(CommandHandler("debug", debug))
+        print("🤖 Telegram Bot 正在运行 (主线程)")
+        app.run_polling()
+    except Exception as e:
+        print(f"❌ Telegram Bot 启动失败: {e}")
+        import traceback
+        traceback.print_exc()
 
-# ==================== Flask 心跳 ====================
+# ==================== Flask ====================
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -1605,7 +1628,9 @@ def health():
     return "Monitoring running", 200
 
 def run_http():
-    flask_app.run(host='0.0.0.0', port=10000)
+    port = int(os.environ.get("PORT", 10000))
+    print(f"🌐 HTTP 心跳服务正在主线程启动，端口: {port}...")
+    flask_app.run(host='0.0.0.0', port=port, debug=False)
 
 # ==================== 启动通知 ====================
 def send_startup_notification():
@@ -1629,7 +1654,7 @@ if __name__ == "__main__":
     print(f"基础 Z-Score 阈值: 多 {ZSCORE_BASE_LONG} / 空 {ZSCORE_BASE_SHORT}")
     print(f"自动过滤: 保留前 {MAX_COINS} 名")
 
-    # 启动所有后台线程
+    # 启动后台线程
     threading.Thread(target=verify_loop, daemon=True).start()
     threading.Thread(target=auto_scan_new_coins, daemon=True).start()
     threading.Thread(target=auto_filter_coins, daemon=True).start()
@@ -1637,13 +1662,13 @@ if __name__ == "__main__":
     threading.Thread(target=independent_scanner, daemon=True).start()
     threading.Thread(target=start_ws, daemon=True).start()
 
-    # 后台启动 Telegram Bot
+    # Telegram Bot 后台启动
     print("🤖 正在后台线程启动 Telegram Bot...")
     bot_thread = threading.Thread(target=run_telegram_bot, daemon=True)
     bot_thread.start()
 
-    # 主线程启动 Flask（先定义 port）
-    import os
-    port = int(os.environ.get("PORT", 10000))
-    print(f"🌐 HTTP 心跳服务正在主线程启动，端口: {port}...")
-    flask_app.run(host='0.0.0.0', port=port)
+    # 启动通知（后台）
+    threading.Thread(target=send_startup_notification, daemon=True).start()
+
+    # 主线程运行 Flask
+    run_http()
