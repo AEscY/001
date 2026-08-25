@@ -12,6 +12,12 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # ==================== 版本信息 ====================
 VERSION = "1.9.0"  # 自适应Z-Score阈值 + 订单簿不平衡 + 历史验证统计
 
+# ==================== 前瞻性引擎配置（v1.8.0/v1.9.0） ====================
+WHALE_VOLUME_THRESHOLD = 3.0   # 鲸鱼追踪成交量暴增倍数
+RISK_PER_TRADE = 0.02          # 单笔风险占资金比例（2%）
+ACCOUNT_BALANCE = 10000        # 默认账户资金（USDT），可自行修改
+PRICE_TRAP_THRESHOLD = 0.005   # 刺破幅度阈值（0.5%）
+
 # ==================== 配置区 ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
