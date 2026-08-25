@@ -10,7 +10,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==================== 版本信息 ====================
-VERSION = "1.6.0"  # 核心：Z-Score 统计背离 + 趋势过滤 + 盈亏比
+VERSION = "1.6.1"  # 修复：分批订阅 WebSocket，避免断开
 
 # ==================== 配置区 ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -67,7 +67,7 @@ price_data = {BTC_SYMBOL: {"price": 0, "change": 0, "volume": 0}}
 for sym in alt_symbols:
     price_data[sym] = {"price": 0, "change": 0, "volume": 0}
 
-# ---- 新增：历史背离差存储（用于 Z-Score） ----
+# ---- 历史背离差存储（用于 Z-Score） ----
 diff_history = {}  # {symbol: [diff1, diff2, ...]} 最多保留 100 个
 
 last_alert_time = {}
@@ -515,7 +515,7 @@ def verify_loop():
             for idx in sorted(to_remove, reverse=True):
                 PENDING_SIGNALS.pop(idx)
 
-# ==================== 9. WebSocket ====================
+# ==================== 9. WebSocket（分批订阅修复） ====================
 def restart_websocket():
     global ws_instance, restart_flag
     with ws_lock:
@@ -560,11 +560,22 @@ def on_open(ws):
     with ws_lock:
         ws_instance = ws
         restart_flag = False
-    print(f"✅ WebSocket已连接，监控 {len(alt_symbols)+1} 个币种")
-    args = [{"channel": "tickers", "instId": BTC_SYMBOL}]
-    for sym in alt_symbols:
-        args.append({"channel": "tickers", "instId": sym})
-    ws.send(json.dumps({"op": "subscribe", "args": args}))
+    
+    # 复制当前监控列表，避免订阅过程中被修改
+    all_symbols = [BTC_SYMBOL] + list(alt_symbols)
+    print(f"✅ WebSocket已连接，监控 {len(all_symbols)} 个币种")
+    
+    # 分批订阅，每批最多 50 个
+    batch_size = 50
+    total_batches = (len(all_symbols) + batch_size - 1) // batch_size
+    
+    for i in range(0, len(all_symbols), batch_size):
+        batch = all_symbols[i:i+batch_size]
+        args = [{"channel": "tickers", "instId": sym} for sym in batch]
+        sub_msg = {"op": "subscribe", "args": args}
+        ws.send(json.dumps(sub_msg))
+        print(f"📨 已发送订阅批次 {i//batch_size + 1}/{total_batches}，共 {len(batch)} 个币种")
+        time.sleep(0.5)  # 避免速率限制
 
 def start_ws():
     while True:
@@ -576,7 +587,7 @@ def start_ws():
             on_close=on_close
         )
         ws.run_forever()
-        time.sleep(2)
+        time.sleep(5)  # 重连间隔 5 秒
 
 # ==================== 10. 币种管理 ====================
 def add_symbol(symbol):
@@ -725,7 +736,7 @@ def auto_filter_coins():
         except Exception as e:
             print(f"自动过滤出错: {e}")
 
-# ==================== 12. 波动扫描（不变） ====================
+# ==================== 12. 波动扫描 ====================
 def volatility_scanner():
     cache = {}
     while True:
@@ -772,7 +783,7 @@ def volatility_scanner():
         except Exception as e:
             print(f"波动扫描出错: {e}")
 
-# ==================== 13. 独立行情监控（使用独立评分） ====================
+# ==================== 13. 独立行情监控 ====================
 def independent_scanner():
     cache = {}
     while True:
@@ -812,7 +823,7 @@ def independent_scanner():
                 
                 price_change = (current_price - prev["price"]) / prev["price"] * 100
                 if abs(price_change) >= INDEPENDENT_THRESHOLD:
-                    # 独立模式直接调用 analyze_signal 并传入 use_independent=True
+                    # 独立模式直接调用 analyze_signal
                     signal_type, score, details = analyze_signal(
                         symbol, diff=0, btc_change=0, alt_change=price_change,
                         volume=float(item.get("volCcy24h", 0)),
@@ -851,7 +862,7 @@ def independent_scanner():
         except Exception as e:
             print(f"独立行情监控出错: {e}")
 
-# ==================== 14. 汇总（不变） ====================
+# ==================== 14. 汇总 ====================
 def generate_summary():
     btc = price_data[BTC_SYMBOL]
     btc_change = btc["change"]
@@ -913,7 +924,7 @@ def stop_auto_refresh():
         auto_refresh_timer.cancel()
         auto_refresh_timer = None
 
-# ==================== 16. Telegram命令（新增 /setzscore 和 /status 显示 Z-Score 参数） ====================
+# ==================== 16. Telegram命令 ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
         return
@@ -1074,9 +1085,7 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("⚠️ 列表已空", reply_markup=get_main_keyboard())
 
-# ---- 评分自定义命令 ----
 async def setdiff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """调整 Z-Score 阈值"""
     global ZSCORE_LONG_THRESHOLD, ZSCORE_SHORT_THRESHOLD
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
         return
