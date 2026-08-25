@@ -10,7 +10,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==================== 版本信息 ====================
-VERSION = "1.5.5"  # 新增信号跳转链接 + 评分自定义
+VERSION = "1.5.6"  # 修复跳转链接币种变量错误
 
 # ==================== 配置区（从环境变量读取） ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -25,13 +25,13 @@ DEFAULT_ALT_SYMBOLS = ["ETH-USDT", "SOL-USDT", "BNB-USDT", "ADA-USDT", "DOGE-USD
 # ==================== 动态评分参数（可通过命令调整） ====================
 BTC_UP = 0.6
 BTC_DOWN = -0.6
-LONG_EXTRA = 0.4          # 可调：/setdiff
-SHORT_EXTRA = -0.4         # 可调：/setdiff
+LONG_EXTRA = 0.4
+SHORT_EXTRA = -0.4
 
-RSI_OVERBOUGHT = 70        # 可调：/setrsi
-RSI_OVERSOLD = 30          # 可调：/setrsi
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD = 30
 
-VOLUME_THRESHOLD = 1000000 # 可调：/setvol
+VOLUME_THRESHOLD = 1000000
 
 ALERT_COOLDOWN = 120
 SUMMARY_MIN_DIFF = 0.3
@@ -154,7 +154,7 @@ def get_funding_rate(symbol):
     except:
         return 0.0
 
-# ==================== 4. 多因子评分（使用动态参数） ====================
+# ==================== 4. 多因子评分 ====================
 def analyze_signal(symbol, diff, btc_change, alt_change, volume, use_independent=False):
     global LONG_EXTRA, SHORT_EXTRA, RSI_OVERBOUGHT, RSI_OVERSOLD, VOLUME_THRESHOLD
     
@@ -231,7 +231,7 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, use_independent
     final_score = max(0, min(100, score))
     return signal_type, final_score, " | ".join(details)
 
-# ==================== 5. 背离检测（含跳转链接） ====================
+# ==================== 5. 背离检测（含跳转链接，修复变量问题） ====================
 def check_divergence():
     btc = price_data[BTC_SYMBOL]
     btc_change = btc["change"]
@@ -260,8 +260,9 @@ def check_divergence():
             last_alert_time[sym] = now
             emoji = "🟢" if signal_type == "LONG" else "🔴"
             action = "做多" if signal_type == "LONG" else "做空"
-            # 构造 OKX 合约深度链接（点击跳转永续合约交易页面）
-            okx_url = f"https://www.okx.com/zh-hans/markets/swap/{sym.lower()}"
+            # 修复：使用当前币种构造链接，避免变量覆盖
+            inst_id = sym
+            okx_url = f"https://www.okx.com/zh-hans/markets/swap/{inst_id.lower()}"
             alert_text = (
                 f"{emoji} 【{action}】[{sym}]({okx_url}) | 评分: {score:.2f}/100\n"
                 f"背离差: {diff:+.2f}% | 价格: ${alt_price:.4f}\n"
@@ -704,7 +705,8 @@ def independent_scanner():
                         emoji = "🟢" if alt_change > 0 else "🔴"
                         action = "做多" if alt_change > 0 else "做空"
                         # 独立信号也添加跳转链接
-                        okx_url = f"https://www.okx.com/zh-hans/markets/swap/{symbol.lower()}"
+                        inst_id = symbol
+                        okx_url = f"https://www.okx.com/zh-hans/markets/swap/{inst_id.lower()}"
                         alerts.append(
                             f"{emoji} 【独立信号·{action}】[{symbol}]({okx_url})\n"
                             f"15分钟 {alt_change:+.2f}% | 现价: ${current_price:.4f}\n"
@@ -792,7 +794,7 @@ def stop_auto_refresh():
         auto_refresh_timer.cancel()
         auto_refresh_timer = None
 
-# ==================== 14. Telegram命令（含评分自定义） ====================
+# ==================== 14. Telegram命令 ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
         return
@@ -951,7 +953,6 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("⚠️ 列表已空", reply_markup=get_main_keyboard())
 
-# ---- 评分自定义命令 ----
 async def setdiff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global LONG_EXTRA, SHORT_EXTRA
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
