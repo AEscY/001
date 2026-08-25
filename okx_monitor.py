@@ -9,9 +9,8 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==================== 配置区（必须修改） ====================
-import os
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "你的Bot Token")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "你的Chat ID")
+TELEGRAM_TOKEN = "你的Bot Token"        # 从 @BotFather 获取
+TELEGRAM_CHAT_ID = "你的Chat ID"        # 从 @userinfobot 获取
 
 BTC_SYMBOL = "BTC-USDT"
 DEFAULT_ALT_SYMBOLS = ["ETH-USDT", "SOL-USDT", "BNB-USDT", "ADA-USDT", "DOGE-USDT", "XRP-USDT"]
@@ -26,7 +25,7 @@ ALERT_COOLDOWN = 120
 # 汇总显示阈值
 SUMMARY_MIN_DIFF = 0.3
 
-# ==================== 验证配置（新增） ====================
+# ==================== 验证配置 ====================
 VERIFY_MINUTES = 15                      # 验证等待时间（分钟）
 VERIFY_PRICE_CHANGE_PCT = 0.8            # 验证成功所需的最小价格变动百分比（%）
 PENDING_SIGNALS = []                     # 存储待验证的信号
@@ -215,10 +214,10 @@ def check_divergence():
                     "price": a["price"],
                     "timestamp": time.time(),
                     "verified": False,
-                    "status": "pending"  # pending / success / failed / expired
+                    "status": "pending"
                 })
 
-# ==================== 5. 验证循环（含阈值 + 超时标记） ====================
+# ==================== 5. 验证循环 ====================
 def verify_loop():
     while True:
         time.sleep(60)
@@ -270,7 +269,6 @@ def verify_loop():
                                 VERIFY_STATS["success"] += 1
                         else:
                             signal["status"] = "failed"
-                            # 不推送失败消息，避免骚扰
                             with STATS_LOCK:
                                 VERIFY_STATS["total"] += 1
                                 VERIFY_STATS["failed"] += 1
@@ -650,8 +648,8 @@ def run_telegram_bot():
     app.add_handler(CommandHandler("addtop", addtop))
     app.add_handler(CommandHandler("removecoin", removecoin))
     app.add_handler(CommandHandler("clear", clear))
-    print("🤖 Telegram Bot 已启动")
-    app.run_polling(signal_handlers=False)
+    print("🤖 Telegram Bot 正在运行 (主线程)")
+    app.run_polling()
 
 # ==================== 12. Flask心跳 ====================
 flask_app = Flask(__name__)
@@ -663,14 +661,22 @@ def health():
 def run_http():
     flask_app.run(host='0.0.0.0', port=10000)
 
-# ==================== 13. 主程序 ====================
+# ==================== 13. 主程序（修复线程冲突） ====================
 if __name__ == "__main__":
     print(f"🚀 合约胜率增强版 (含验证阈值) 启动于 {datetime.now()}")
     print(f"初始监控: {BTC_SYMBOL} + {', '.join(DEFAULT_ALT_SYMBOLS)}")
     print(f"验证阈值: {VERIFY_PRICE_CHANGE_PCT}% | 等待时间: {VERIFY_MINUTES}分钟")
 
+    # 启动后台线程（验证、扫描、WebSocket）
     threading.Thread(target=verify_loop, daemon=True).start()
     threading.Thread(target=auto_scan_new_coins, daemon=True).start()
-    threading.Thread(target=run_telegram_bot, daemon=True).start()
     threading.Thread(target=start_ws, daemon=True).start()
-    run_http()
+
+    # 将 Flask HTTP 服务放在子线程（避免占用主线程）
+    http_thread = threading.Thread(target=run_http, daemon=True)
+    http_thread.start()
+    print("🌐 HTTP 心跳服务已启动 (子线程)")
+
+    # 主线程运行 Telegram Bot（避免信号处理冲突）
+    print("🤖 正在主线程启动 Telegram Bot...")
+    run_telegram_bot()
