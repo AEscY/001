@@ -1,16 +1,15 @@
+import os
 import websocket
 import json
 import requests
 import time
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 from flask import Flask
-from telegram import Update
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ==================== 配置区（必须修改） ====================
-import os
-
+# ==================== 配置区（从环境变量读取） ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
@@ -54,6 +53,18 @@ restart_flag = False
 auto_refresh_enabled = False
 auto_refresh_interval = 300
 auto_refresh_timer = None
+
+# ==================== 菜单键盘 ====================
+def get_main_keyboard():
+    """生成主菜单键盘（常驻）"""
+    buttons = [
+        [KeyboardButton("/status"), KeyboardButton("/summary")],
+        [KeyboardButton("/autorefresh on"), KeyboardButton("/autorefresh off")],
+        [KeyboardButton("/addcoin"), KeyboardButton("/addtop")],
+        [KeyboardButton("/removecoin"), KeyboardButton("/clear")],
+        [KeyboardButton("/help")]
+    ]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
 
 # ==================== 推送函数 ====================
 def send_telegram(msg):
@@ -498,12 +509,14 @@ def stop_auto_refresh():
         auto_refresh_timer.cancel()
         auto_refresh_timer = None
 
-# ==================== 10. Telegram命令 ====================
+# ==================== 10. Telegram命令（含键盘） ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
         return
     await update.message.reply_text(
         "🤖 合约胜率增强Bot (含验证阈值)\n"
+        "点击下方按钮快速输入命令，再补充参数即可。\n\n"
+        "命令说明：\n"
         "/status - 查看监控状态 + 验证统计\n"
         "/summary - 立即获取强弱汇总\n"
         "/autorefresh on - 开启自动刷新(5分钟)\n"
@@ -513,8 +526,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/addtop <数量> - 添加交易量前N\n"
         "/removecoin <币种> - 移除\n"
         "/clear - 清空所有山寨币\n"
-        "/help - 此帮助"
+        "/help - 此帮助",
+        reply_markup=get_main_keyboard()
     )
+
+async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start(update, context)
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
@@ -543,7 +560,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg += "\n\n列表: " + ", ".join(list(alt_symbols)[:15])
     if count > 15:
         msg += f" ... 共{count}个"
-    await update.message.reply_text(msg)
+    await update.message.reply_text(msg, reply_markup=get_main_keyboard())
 
 async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
@@ -551,34 +568,34 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = generate_summary()
     if len(msg) > 4000:
         for i in range(0, len(msg), 4000):
-            await update.message.reply_text(msg[i:i+4000])
+            await update.message.reply_text(msg[i:i+4000], reply_markup=get_main_keyboard())
     else:
-        await update.message.reply_text(msg)
+        await update.message.reply_text(msg, reply_markup=get_main_keyboard())
 
 async def autorefresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global auto_refresh_interval
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
         return
     if not context.args:
-        await update.message.reply_text("用法: /autorefresh on/off/分钟数")
+        await update.message.reply_text("用法: /autorefresh on/off/分钟数", reply_markup=get_main_keyboard())
         return
     arg = context.args[0].lower()
     if arg == "on":
         if not auto_refresh_enabled:
             start_auto_refresh()
-            await update.message.reply_text(f"✅ 自动刷新已开启，间隔 {auto_refresh_interval//60} 分钟")
+            await update.message.reply_text(f"✅ 自动刷新已开启，间隔 {auto_refresh_interval//60} 分钟", reply_markup=get_main_keyboard())
         else:
-            await update.message.reply_text("ℹ️ 已开启")
+            await update.message.reply_text("ℹ️ 已开启", reply_markup=get_main_keyboard())
     elif arg == "off":
         if auto_refresh_enabled:
             stop_auto_refresh()
-            await update.message.reply_text("🔴 已关闭")
+            await update.message.reply_text("🔴 已关闭", reply_markup=get_main_keyboard())
         else:
-            await update.message.reply_text("ℹ️ 已关闭")
+            await update.message.reply_text("ℹ️ 已关闭", reply_markup=get_main_keyboard())
     elif arg.isdigit():
         minutes = int(arg)
         if minutes < 1 or minutes > 60:
-            await update.message.reply_text("⚠️ 间隔 1~60 分钟")
+            await update.message.reply_text("⚠️ 间隔 1~60 分钟", reply_markup=get_main_keyboard())
             return
         auto_refresh_interval = minutes * 60
         if auto_refresh_enabled:
@@ -586,24 +603,24 @@ async def autorefresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
             start_auto_refresh()
         else:
             start_auto_refresh()
-        await update.message.reply_text(f"✅ 间隔设为{minutes}分钟，已开启")
+        await update.message.reply_text(f"✅ 间隔设为{minutes}分钟，已开启", reply_markup=get_main_keyboard())
     else:
-        await update.message.reply_text("参数错误")
+        await update.message.reply_text("参数错误", reply_markup=get_main_keyboard())
 
 async def addcoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
         return
     if not context.args:
-        await update.message.reply_text("用法: /addcoin PEPE-USDT")
+        await update.message.reply_text("用法: /addcoin PEPE-USDT", reply_markup=get_main_keyboard())
         return
     sym = context.args[0].upper()
     if not sym.endswith("-USDT"):
-        await update.message.reply_text("格式错误，需为 币种-USDT")
+        await update.message.reply_text("格式错误，需为 币种-USDT", reply_markup=get_main_keyboard())
         return
     if add_symbol(sym):
-        await update.message.reply_text(f"✅ 已添加 {sym}")
+        await update.message.reply_text(f"✅ 已添加 {sym}", reply_markup=get_main_keyboard())
     else:
-        await update.message.reply_text(f"⚠️ {sym} 已存在或无效")
+        await update.message.reply_text(f"⚠️ {sym} 已存在或无效", reply_markup=get_main_keyboard())
 
 async def addtop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
@@ -612,40 +629,40 @@ async def addtop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args and context.args[0].isdigit():
         n = int(context.args[0])
     if n > 200:
-        await update.message.reply_text("⚠️ 数量过大，建议≤200")
+        await update.message.reply_text("⚠️ 数量过大，建议≤200", reply_markup=get_main_keyboard())
         n = 200
-    await update.message.reply_text(f"⏳ 获取交易量前{n}的币种...")
+    await update.message.reply_text(f"⏳ 获取交易量前{n}的币种...", reply_markup=get_main_keyboard())
     added = add_top_n(n)
     if added:
-        await update.message.reply_text(f"✅ 添加 {len(added)} 个: {', '.join(added[:10])}" + ("..." if len(added)>10 else ""))
+        await update.message.reply_text(f"✅ 添加 {len(added)} 个: {', '.join(added[:10])}" + ("..." if len(added)>10 else ""), reply_markup=get_main_keyboard())
     else:
-        await update.message.reply_text("⚠️ 无新币种")
+        await update.message.reply_text("⚠️ 无新币种", reply_markup=get_main_keyboard())
 
 async def removecoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
         return
     if not context.args:
-        await update.message.reply_text("用法: /removecoin ETH-USDT")
+        await update.message.reply_text("用法: /removecoin ETH-USDT", reply_markup=get_main_keyboard())
         return
     sym = context.args[0].upper()
     if remove_symbol(sym):
-        await update.message.reply_text(f"✅ 已移除 {sym}")
+        await update.message.reply_text(f"✅ 已移除 {sym}", reply_markup=get_main_keyboard())
     else:
-        await update.message.reply_text(f"⚠️ {sym} 不存在或为主币")
+        await update.message.reply_text(f"⚠️ {sym} 不存在或为主币", reply_markup=get_main_keyboard())
 
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
         return
     if clear_alts():
-        await update.message.reply_text("✅ 已清空所有山寨币，仅保留BTC")
+        await update.message.reply_text("✅ 已清空所有山寨币，仅保留BTC", reply_markup=get_main_keyboard())
     else:
-        await update.message.reply_text("⚠️ 列表已空")
+        await update.message.reply_text("⚠️ 列表已空", reply_markup=get_main_keyboard())
 
-# ==================== 11. Telegram Bot ====================
+# ==================== 11. Telegram Bot（主线程） ====================
 def run_telegram_bot():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", start))
+    app.add_handler(CommandHandler("help", help))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("summary", summary))
     app.add_handler(CommandHandler("autorefresh", autorefresh))
@@ -656,7 +673,7 @@ def run_telegram_bot():
     print("🤖 Telegram Bot 正在运行 (主线程)")
     app.run_polling()
 
-# ==================== 12. Flask心跳 ====================
+# ==================== 12. Flask心跳（子线程） ====================
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -666,7 +683,7 @@ def health():
 def run_http():
     flask_app.run(host='0.0.0.0', port=10000)
 
-# ==================== 13. 主程序（修复线程冲突） ====================
+# ==================== 13. 主程序 ====================
 if __name__ == "__main__":
     print(f"🚀 合约胜率增强版 (含验证阈值) 启动于 {datetime.now()}")
     print(f"初始监控: {BTC_SYMBOL} + {', '.join(DEFAULT_ALT_SYMBOLS)}")
@@ -677,11 +694,11 @@ if __name__ == "__main__":
     threading.Thread(target=auto_scan_new_coins, daemon=True).start()
     threading.Thread(target=start_ws, daemon=True).start()
 
-    # 将 Flask HTTP 服务放在子线程（避免占用主线程）
+    # Flask HTTP 放在子线程
     http_thread = threading.Thread(target=run_http, daemon=True)
     http_thread.start()
     print("🌐 HTTP 心跳服务已启动 (子线程)")
 
-    # 主线程运行 Telegram Bot（避免信号处理冲突）
+    # 主线程运行 Telegram Bot（避免信号冲突）
     print("🤖 正在主线程启动 Telegram Bot...")
     run_telegram_bot()
