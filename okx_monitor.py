@@ -9,6 +9,9 @@ from flask import Flask
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+# ==================== 版本信息（每次更新时修改） ====================
+VERSION = "1.3.0"   # 更新代码时手动修改此版本号
+
 # ==================== 配置区（从环境变量读取） ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -44,8 +47,8 @@ FILTER_INTERVAL = 1800
 
 # ==================== 波动扫描配置 ====================
 VOLATILITY_SCAN_ENABLED = True
-VOLATILITY_THRESHOLD = 3.0              # 波动阈值（%），可通过 /setvolatility 命令动态调整
-VOLATILITY_SCAN_INTERVAL = 60           # 扫描间隔（秒），默认1分钟
+VOLATILITY_THRESHOLD = 3.0              # 可通过 /setvolatility 命令动态调整
+VOLATILITY_SCAN_INTERVAL = 60
 
 # ==================== 全局状态 ====================
 alt_symbols = set(DEFAULT_ALT_SYMBOLS)
@@ -608,7 +611,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
         return
     await update.message.reply_text(
-        "🤖 合约胜率增强Bot (含验证阈值 + 自动过滤 + 波动扫描)\n"
+        f"🤖 合约胜率增强Bot v{VERSION}\n"
         "点击下方按钮快速输入命令，再补充参数即可。\n\n"
         "命令说明：\n"
         "/status - 查看监控状态 + 验证统计\n"
@@ -757,7 +760,6 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("⚠️ 列表已空", reply_markup=get_main_keyboard())
 
-# ==================== 新增：动态调整波动阈值命令 ====================
 async def setvolatility(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """设置波动扫描阈值（百分比）"""
     global VOLATILITY_THRESHOLD
@@ -797,7 +799,7 @@ def run_telegram_bot():
     app.add_handler(CommandHandler("addtop", addtop))
     app.add_handler(CommandHandler("removecoin", removecoin))
     app.add_handler(CommandHandler("clear", clear))
-    app.add_handler(CommandHandler("setvolatility", setvolatility))  # 注册新命令
+    app.add_handler(CommandHandler("setvolatility", setvolatility))
     print("🤖 Telegram Bot 正在运行 (主线程)")
     app.run_polling()
 
@@ -811,9 +813,22 @@ def health():
 def run_http():
     flask_app.run(host='0.0.0.0', port=10000)
 
-# ==================== 15. 主程序 ====================
+# ==================== 15. 启动通知（新增） ====================
+def send_startup_notification():
+    """延迟发送启动通知，确保服务完全启动"""
+    time.sleep(8)  # 等待 Bot 和 WebSocket 初始化
+    msg = (
+        f"🚀 **Bot 已重新启动！**\n"
+        f"版本: {VERSION}\n"
+        f"启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"监控币种: {len(alt_symbols)} 个山寨币\n"
+        f"使用 /status 查看详情"
+    )
+    send_telegram(msg)
+
+# ==================== 16. 主程序 ====================
 if __name__ == "__main__":
-    print(f"🚀 合约胜率增强版 (含验证阈值 + 自动过滤 + 波动扫描) 启动于 {datetime.now()}")
+    print(f"🚀 合约胜率增强版 v{VERSION} 启动于 {datetime.now()}")
     print(f"初始监控: {BTC_SYMBOL} + {', '.join(DEFAULT_ALT_SYMBOLS)}")
     print(f"验证阈值: {VERIFY_PRICE_CHANGE_PCT}% | 等待时间: {VERIFY_MINUTES}分钟")
     print(f"自动过滤: {'开启' if AUTO_FILTER_ENABLED else '关闭'}，保留前 {MAX_COINS} 名，间隔 {FILTER_INTERVAL//60} 分钟")
@@ -830,6 +845,9 @@ if __name__ == "__main__":
     http_thread = threading.Thread(target=run_http, daemon=True)
     http_thread.start()
     print("🌐 HTTP 心跳服务已启动 (子线程)")
+
+    # 发送启动通知（延迟执行）
+    threading.Thread(target=send_startup_notification, daemon=True).start()
 
     # 主线程运行 Telegram Bot
     print("🤖 正在主线程启动 Telegram Bot...")
