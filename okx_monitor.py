@@ -10,7 +10,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==================== 版本信息 ====================
-VERSION = "1.5.1"  # 修复 priceChangePercent 字段
+VERSION = "1.5.2"  # 增强字段解析 + 调试打印
 
 # ==================== 配置区（从环境变量读取） ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -345,7 +345,7 @@ def verify_loop():
             for idx in sorted(to_remove, reverse=True):
                 PENDING_SIGNALS.pop(idx)
 
-# ==================== 7. WebSocket ====================
+# ==================== 7. WebSocket（增强字段解析 + 调试） ====================
 def restart_websocket():
     global ws_instance, restart_flag
     with ws_lock:
@@ -357,15 +357,23 @@ def restart_websocket():
 def on_message(ws, message):
     try:
         data = json.loads(message)
+        # 调试：打印第一条数据的字段名
+        if "data" in data and len(data["data"]) > 0:
+            first_item = data["data"][0]
+            if "instId" in first_item and first_item["instId"] == BTC_SYMBOL:
+                print("📦 BTC数据字段:", list(first_item.keys()))
         if "data" not in data:
             return
         for item in data["data"]:
             inst_id = item.get("instId", "")
             if inst_id not in price_data:
                 continue
-            # 修复：使用 priceChangePercent 而非 idxPx
             price = float(item.get("last", 0))
-            change = float(item.get("priceChangePercent", 0))
+            # 尝试多个可能的字段名
+            change = float(item.get("priceChangePercent",
+                         item.get("priceChangePcnt",
+                         item.get("changeRate",
+                         item.get("priceChange", 0)))))
             volume = float(item.get("vol24h", 0))
             price_data[inst_id]["price"] = price
             price_data[inst_id]["change"] = change
@@ -790,6 +798,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/removecoin <币种> - 移除\n"
         "/clear - 清空所有山寨币\n"
         "/setvolatility <数值> - 设置波动扫描阈值(0.5~20%)\n"
+        "/debug - 打印当前BTC数据字段(调试)\n"
         "/help - 此帮助",
         reply_markup=get_main_keyboard()
     )
@@ -954,6 +963,17 @@ async def setvolatility(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("⚠️ 请输入有效的数字，如 /setvolatility 3.5", reply_markup=get_main_keyboard())
 
+# ==================== 新增调试命令 ====================
+async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
+        return
+    btc = price_data.get(BTC_SYMBOL)
+    if btc:
+        msg = f"🔍 **BTC 当前数据**\n价格: ${btc['price']:.2f}\n24h涨跌幅: {btc['change']:.2f}%\n成交量: {btc['volume']:.0f}\n\n请检查Render日志中打印的字段名。"
+    else:
+        msg = "❌ 未获取到BTC数据"
+    await update.message.reply_text(msg, reply_markup=get_main_keyboard())
+
 # ==================== 15. Telegram Bot ====================
 def run_telegram_bot():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -967,6 +987,7 @@ def run_telegram_bot():
     app.add_handler(CommandHandler("removecoin", removecoin))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("setvolatility", setvolatility))
+    app.add_handler(CommandHandler("debug", debug))  # 新增
     print("🤖 Telegram Bot 正在运行 (主线程)")
     app.run_polling()
 
