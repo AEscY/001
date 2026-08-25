@@ -4,13 +4,13 @@ import json
 import requests
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==================== 版本信息 ====================
-VERSION = "1.7.0"  # 全面感知引擎：情绪指数 + 板块强度 + 多周期共振 + 市场深度
+VERSION = "1.8.0"  # 前瞻性引擎：鲸鱼追踪 + 流动性猎取 + 动态仓位 + 时段过滤 + RSI入场增强
 
 # ==================== 配置区 ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -22,21 +22,27 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
 BTC_SYMBOL = "BTC-USDT"
 DEFAULT_ALT_SYMBOLS = ["ETH-USDT", "SOL-USDT", "BNB-USDT", "ADA-USDT", "DOGE-USDT", "XRP-USDT"]
 
-# 基础参数（Z-Score 阈值替代固定背离差）
-BTC_TREND_THRESHOLD = 0.3      # BTC 波动 >0.3% 才启用趋势模式
-ZSCORE_LONG_THRESHOLD = 1.8    # Z-Score > 1.8 视为强势（做多）
-ZSCORE_SHORT_THRESHOLD = -1.8  # Z-Score < -1.8 视为弱势（做空）
-MIN_ZSCORE_SAMPLES = 20        # 最少样本数才启用 Z-Score，否则回退固定阈值
-FALLBACK_LONG = 0.6            # 样本不足时的固定做多阈值
-FALLBACK_SHORT = -0.6          # 样本不足时的固定做空阈值
+# 基础参数
+BTC_TREND_THRESHOLD = 0.3
+ZSCORE_LONG_THRESHOLD = 1.8
+ZSCORE_SHORT_THRESHOLD = -1.8
+MIN_ZSCORE_SAMPLES = 20
+FALLBACK_LONG = 0.6
+FALLBACK_SHORT = -0.6
 
-# RSI / 费率 / 成交量参数（可调）
 RSI_OVERBOUGHT = 70
 RSI_OVERSOLD = 30
 VOLUME_THRESHOLD = 1000000
 
 ALERT_COOLDOWN = 120
 SUMMARY_MIN_DIFF = 0.3
+
+# ==================== 前瞻性引擎配置 ====================
+WHALE_VOLUME_THRESHOLD = 3.0       # 成交量暴增倍数
+RISK_PER_TRADE = 0.02              # 单笔风险占资金比例（2%）
+ACCOUNT_BALANCE = 10000            # 默认账户资金（USDT），可自行修改
+LIQUIDITY_TRAP_WINDOW = 5          # 假突破检测窗口（分钟）
+PRICE_TRAP_THRESHOLD = 0.005       # 刺破幅度阈值（0.5%）
 
 # ==================== 验证配置 ====================
 VERIFY_MINUTES = 15
@@ -77,6 +83,9 @@ auto_refresh_enabled = False
 auto_refresh_interval = 300
 auto_refresh_timer = None
 
+# 流动性猎取辅助缓存（存储最近5分钟K线）
+price_candle_cache = {}  # {symbol: [(timestamp, open, high, low, close, volume), ...]}
+
 # ==================== 菜单键盘 ====================
 def get_main_keyboard():
     buttons = [
@@ -84,7 +93,7 @@ def get_main_keyboard():
         [KeyboardButton("/autorefresh on"), KeyboardButton("/autorefresh off")],
         [KeyboardButton("/addcoin"), KeyboardButton("/addtop")],
         [KeyboardButton("/removecoin"), KeyboardButton("/clear")],
-        [KeyboardButton("/setdiff"), KeyboardButton("/setrsi"), KeyboardButton("/setvol")],
+        [KeyboardButton("/setdiff"), KeyboardButton("/setvol")],
         [KeyboardButton("/setvolatility"), KeyboardButton("/sentiment"), KeyboardButton("/debug")],
         [KeyboardButton("/help")]
     ]
@@ -101,7 +110,7 @@ def send_telegram(msg, parse_mode=None):
     except Exception as e:
         print(f"推送失败: {e}")
 
-# ==================== 1. 基础工具函数 ====================
+# ==================== 基础工具函数 ====================
 def get_swap_symbols():
     try:
         url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
@@ -194,9 +203,8 @@ def get_atr_percent(symbol, period=14):
     except:
         return 0.5
 
-# ==================== 2. 全面感知引擎（新增核心函数） ====================
+# ==================== 全面感知引擎 ====================
 def get_market_sentiment():
-    """市场情绪指数 0~100 (0极度恐惧, 100极度贪婪)"""
     try:
         main_coins = ["BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT"]
         changes = []
@@ -222,7 +230,6 @@ def get_market_sentiment():
         return 50
 
 def get_sector_strength(symbol):
-    """返回该币种所属板块的24h平均涨跌幅，若无板块返回0"""
     sector_map = {
         "ETH": "Layer1", "SOL": "Layer1", "ADA": "Layer1", "AVAX": "Layer1",
         "UNI": "DeFi", "AAVE": "DeFi", "MKR": "DeFi", "COMP": "DeFi",
@@ -246,7 +253,6 @@ def get_sector_strength(symbol):
     return sum(changes) / len(changes)
 
 def get_mtf_alignment(symbol, current_price):
-    """多时间框架背离方向 (1h,4h,24h) 返回 (方向, 加分)"""
     try:
         intervals = ["1h", "4h", "24h"]
         directions = []
@@ -292,7 +298,6 @@ def get_mtf_alignment(symbol, current_price):
         return "NEUTRAL", 0
 
 def get_bid_ask_ratio(symbol):
-    """返回买单深度/卖单深度比例，>1表示买盘强"""
     try:
         url = f"https://www.okx.com/api/v5/market/books?instId={symbol}&sz=10"
         resp = requests.get(url, timeout=3)
@@ -310,7 +315,6 @@ def get_bid_ask_ratio(symbol):
         return 1.0
 
 def get_atr_ratio(symbol, period=20):
-    """获取 ATR 扩张率 (当前ATR / 过去20日平均ATR)"""
     try:
         url = f"https://www.okx.com/api/v5/market/history-candles?instId={symbol}&bar=1h&limit={period+10}"
         resp = requests.get(url, timeout=5)
@@ -336,7 +340,6 @@ def get_atr_ratio(symbol, period=20):
         return 1.0
 
 def get_price_position(symbol, current_price, period=20):
-    """获取当前价格在过去20日K线中的位置 (0~1)"""
     try:
         url = f"https://www.okx.com/api/v5/market/history-candles?instId={symbol}&bar=4H&limit={period+5}"
         resp = requests.get(url, timeout=5)
@@ -357,7 +360,6 @@ def get_price_position(symbol, current_price, period=20):
         return 0.5
 
 def get_premium(symbol):
-    """获取永续合约相对现货的基差 (%)"""
     try:
         spot_symbol = symbol
         swap_symbol = symbol.replace("-USDT", "-USDT-SWAP")
@@ -378,7 +380,109 @@ def get_premium(symbol):
         return (swap_price - spot_price) / spot_price * 100
     except:
         return 0.0
-        
+
+# ==================== 前瞻性引擎函数 ====================
+def get_whale_score(symbol):
+    """成交量异动评分 (0~15)"""
+    try:
+        url = f"https://www.okx.com/api/v5/market/history-candles?instId={symbol}&bar=1m&limit=20"
+        resp = requests.get(url, timeout=3)
+        data = resp.json()
+        if data["code"] != "0":
+            return 0
+        candles = data["data"]
+        if len(candles) < 16:
+            return 0
+        recent_vol = sum(float(c[5]) for c in candles[-5:])
+        avg_vol = sum(float(c[5]) for c in candles[-16:-6]) / 10
+        if avg_vol == 0:
+            return 0
+        ratio = recent_vol / avg_vol
+        if ratio > WHALE_VOLUME_THRESHOLD:
+            return min(15, int(ratio * 5))
+        return 0
+    except:
+        return 0
+
+def update_candle_cache(symbol, close_price, volume):
+    """更新K线缓存（用于流动性猎取检测）"""
+    now = datetime.utcnow()
+    if symbol not in price_candle_cache:
+        price_candle_cache[symbol] = []
+    # 每5分钟缓存一次，简化：仅记录最新数据
+    price_candle_cache[symbol].append((now, close_price, volume))
+    if len(price_candle_cache[symbol]) > 20:
+        price_candle_cache[symbol].pop(0)
+
+def get_liquidity_trap_score(symbol, current_price):
+    """
+    检测假突破/假跌破
+    返回 (score, description)
+    """
+    try:
+        ema50 = get_ema(symbol)
+        if ema50 == 0:
+            return 0, ""
+        # 获取前5分钟的价格数据（简化：从缓存获取）
+        if symbol not in price_candle_cache or len(price_candle_cache[symbol]) < 2:
+            return 0, ""
+        recent = price_candle_cache[symbol]
+        # 检测最近5分钟内是否刺破EMA50又收回
+        lows = [p[1] for p in recent[-5:] if p[1] > 0]
+        highs = [p[1] for p in recent[-5:] if p[1] > 0]
+        if not lows or not highs:
+            return 0, ""
+        min_low = min(lows)
+        max_high = max(highs)
+        # 假跌破：价格跌破EMA50下方0.5%以内，然后又回到EMA上方
+        if min_low < ema50 * (1 - PRICE_TRAP_THRESHOLD) and current_price > ema50:
+            return 20, "假跌破反转 +20"
+        # 假突破：价格突破EMA50上方0.5%以内，然后又回到EMA下方
+        if max_high > ema50 * (1 + PRICE_TRAP_THRESHOLD) and current_price < ema50:
+            return 20, "假突破反转 +20"
+        return 0, ""
+    except:
+        return 0, ""
+
+def calculate_position(current_price, atr_pct, score, account_balance=ACCOUNT_BALANCE):
+    """返回建议张数 (基于USDT本位合约)"""
+    if atr_pct <= 0:
+        atr_pct = 0.5
+    stop_loss_pct = atr_pct * 1.5
+    risk_amount = account_balance * RISK_PER_TRADE
+    adjusted_risk = risk_amount * (0.5 + (score / 100) * 0.5)
+    contract_size = adjusted_risk / (current_price * (stop_loss_pct / 100))
+    return max(1, int(contract_size))
+
+def get_session_score():
+    """时段加分 (UTC时间)"""
+    hour = datetime.utcnow().hour
+    if 12 <= hour <= 18:
+        return 10
+    elif 22 <= hour or hour <= 2:
+        return 5
+    elif 6 <= hour <= 10:
+        return -10
+    return 0
+
+def get_rsi_entry_advice(symbol, signal_type):
+    """返回入场建议文本"""
+    rsi = calculate_rsi(symbol, interval="1h")
+    if signal_type == "LONG":
+        if rsi < 50:
+            return "建议现价入场"
+        elif rsi < 65:
+            return "建议回调至EMA10附近挂单"
+        else:
+            return "RSI超买，建议等待回调再入场"
+    else:  # SHORT
+        if rsi > 50:
+            return "建议现价入场"
+        elif rsi > 35:
+            return "建议反弹至EMA10附近挂单"
+        else:
+            return "RSI超卖，建议等待反弹再入场"
+
 # ==================== Z-Score 历史管理 ====================
 def update_diff_history(symbol, current_diff, max_len=100):
     if symbol not in diff_history:
@@ -398,8 +502,8 @@ def get_zscore(symbol, current_diff):
     if std == 0:
         return 0
     return (current_diff - mean) / std
-
-# ==================== 核心评分函数（集成全面感知因子） ====================
+    
+# ==================== 核心评分函数（集成所有因子） ====================
 def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, use_independent=False):
     if use_independent:
         if alt_change > 0:
@@ -588,7 +692,7 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
         else:
             details.append(f"价格中位 ({position:.0%})")
 
-    # 7. 合约基差（避免拥挤）
+    # 7. 合约基差
     premium = get_premium(symbol)
     if signal_type == "LONG":
         if premium > 0.05:
@@ -601,7 +705,30 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
         else:
             details.append(f"基差{premium:+.2f}%正常")
 
-    # ---- 盈亏比 ----
+    # ========== 前瞻性引擎因子 ==========
+    # 8. 鲸鱼追踪（成交量异动）
+    whale = get_whale_score(symbol)
+    if whale > 0:
+        score += whale
+        details.append(f"鲸鱼异动 +{whale}")
+
+    # 9. 流动性猎取（假突破检测）
+    trap_score, trap_desc = get_liquidity_trap_score(symbol, current_price)
+    if trap_score != 0:
+        score += trap_score
+        details.append(trap_desc)
+
+    # 10. 时段过滤
+    session_score = get_session_score()
+    if session_score != 0:
+        score += session_score
+        details.append(f"时段{session_score:+d}")
+
+    # 11. RSI入场增强（仅添加建议，不改变评分）
+    entry_advice = get_rsi_entry_advice(symbol, signal_type)
+    details.append(f"入场建议：{entry_advice}")
+
+    # ---- 盈亏比 & 动态仓位 ----
     atr_pct = get_atr_percent(symbol)
     if signal_type == "LONG":
         sl = current_price * (1 - atr_pct * 1.5 / 100)
@@ -613,6 +740,10 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
         tp = current_price * (1 - atr_pct * 2.5 / 100)
         rr = (current_price - tp) / (sl - current_price) if (sl - current_price) > 0 else 0
         details.append(f"止损 {sl:.4f} 止盈 {tp:.4f} 盈亏比 {rr:.1f}:1")
+
+    # 仓位计算
+    position_size = calculate_position(current_price, atr_pct, score)
+    details.append(f"建议仓位：{position_size} 张 (风险{RISK_PER_TRADE*100:.1f}%)")
 
     final_score = max(0, min(100, score))
     return signal_type, final_score, " | ".join(details)
@@ -634,6 +765,8 @@ def check_divergence():
         diff = alt_change - btc_change
         volume = alt.get("volume", 0)
 
+        # 更新K线缓存（用于流动性猎取）
+        update_candle_cache(sym, alt_price, volume)
         update_diff_history(sym, diff)
 
         if sym in last_alert_time and (now - last_alert_time[sym]) < ALERT_COOLDOWN:
@@ -679,7 +812,7 @@ def check_divergence():
                     "status": "pending"
                 })
 
-# ==================== 验证循环（不变） ====================
+# ==================== 验证循环 ====================
 def verify_loop():
     while True:
         time.sleep(60)
@@ -814,13 +947,14 @@ def start_ws():
         ws.run_forever()
         time.sleep(5)
 
-# ==================== 币种管理（含历史初始化） ====================
+# ==================== 币种管理 ====================
 def add_symbol(symbol):
     if symbol == BTC_SYMBOL or symbol in alt_symbols:
         return False
     alt_symbols.add(symbol)
     price_data[symbol] = {"price": 0, "change": 0, "volume": 0}
     diff_history[symbol] = []
+    price_candle_cache[symbol] = []
     restart_websocket()
     return True
 
@@ -830,6 +964,7 @@ def remove_symbol(symbol):
     alt_symbols.remove(symbol)
     price_data.pop(symbol, None)
     diff_history.pop(symbol, None)
+    price_candle_cache.pop(symbol, None)
     restart_websocket()
     return True
 
@@ -840,6 +975,7 @@ def clear_alts():
         alt_symbols.remove(sym)
         price_data.pop(sym, None)
         diff_history.pop(sym, None)
+        price_candle_cache.pop(sym, None)
     restart_websocket()
     return True
 
@@ -868,6 +1004,7 @@ def add_top_n(n):
                 alt_symbols.add(sym)
                 price_data[sym] = {"price": 0, "change": 0, "volume": 0}
                 diff_history[sym] = []
+                price_candle_cache[sym] = []
                 added.append(sym)
         if added:
             restart_websocket()
@@ -895,6 +1032,7 @@ def auto_scan_new_coins():
                             alt_symbols.add(sym)
                             price_data[sym] = {"price": 0, "change": 0, "volume": 0}
                             diff_history[sym] = []
+                            price_candle_cache[sym] = []
                     known_symbols.update(new_coins)
                     restart_websocket()
                     send_telegram(f"🆕 自动发现新合约币种并已添加监控: {', '.join(new_coins)}")
@@ -935,10 +1073,12 @@ def auto_filter_coins():
                     alt_symbols.remove(sym)
                     price_data.pop(sym, None)
                     diff_history.pop(sym, None)
+                    price_candle_cache.pop(sym, None)
                 for sym in to_add:
                     alt_symbols.add(sym)
                     price_data[sym] = {"price": 0, "change": 0, "volume": 0}
                     diff_history[sym] = []
+                    price_candle_cache[sym] = []
                 restart_websocket()
                 msg = (
                     f"🔄 自动过滤已更新监控列表\n"
@@ -984,6 +1124,7 @@ def volatility_scanner():
                             alt_symbols.add(symbol)
                             price_data[symbol] = {"price": current_price, "change": 0, "volume": 0}
                             diff_history[symbol] = []
+                            price_candle_cache[symbol] = []
                 cache[symbol] = current_price
             if alerts:
                 msg = "🚨 **突发异动警报（小币种）**\n"
@@ -1049,6 +1190,7 @@ def independent_scanner():
                             alt_symbols.add(symbol)
                             price_data[symbol] = {"price": current_price, "change": 0, "volume": 0}
                             diff_history[symbol] = []
+                            price_candle_cache[symbol] = []
                     cache[symbol]["processed"] = True
                     cache[symbol]["price"] = current_price
                     cache[symbol]["time"] = now
@@ -1063,7 +1205,7 @@ def independent_scanner():
         except Exception as e:
             print(f"独立行情监控出错: {e}")
 
-# ==================== 汇总、自动刷新、Telegram命令 ====================
+# ==================== 汇总、自动刷新 ====================
 def generate_summary():
     btc = price_data[BTC_SYMBOL]
     btc_change = btc["change"]
@@ -1122,19 +1264,20 @@ def stop_auto_refresh():
         auto_refresh_timer.cancel()
         auto_refresh_timer = None
 
-# ==================== Telegram 命令处理器 ====================
+# ==================== Telegram 命令 ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
         return
     await update.message.reply_text(
         f"🤖 **合约胜率增强Bot v{VERSION}**\n"
-        "全面感知引擎：情绪指数 + 板块轮动 + 多周期共振 + 市场深度\n\n"
+        "前瞻性引擎：鲸鱼追踪 + 流动性猎取 + 动态仓位 + 时段过滤 + RSI入场增强\n\n"
         "📊 **命令**：\n"
         "/status – 状态 & 参数\n"
         "/summary – 强弱汇总\n"
         "/autorefresh on/off – 自动刷新\n"
         "/addcoin / addtop – 管理币种\n"
         "/setdiff – 调整 Z-Score 阈值\n"
+        "/setvol – 调整成交量阈值\n"
         "/setvolatility – 波动扫描阈值\n"
         "/sentiment – 市场情绪指数\n"
         "/debug – BTC数据\n"
@@ -1309,6 +1452,31 @@ async def setdiff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("⚠️ 请输入有效数字，如 /setdiff 1.8 -1.8", reply_markup=get_main_keyboard())
 
+async def setvol(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global VOLUME_THRESHOLD
+    if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            f"📊 当前成交量阈值: {VOLUME_THRESHOLD/1000000:.1f}M USDT\n"
+            "用法: /setvol <数值>（单位：百万）\n"
+            "示例: /setvol 1.5",
+            reply_markup=get_main_keyboard()
+        )
+        return
+    try:
+        val = float(context.args[0])
+        if val < 0.1 or val > 20:
+            await update.message.reply_text("⚠️ 范围 0.1~20M", reply_markup=get_main_keyboard())
+            return
+        VOLUME_THRESHOLD = val * 1000000
+        await update.message.reply_text(
+            f"✅ 成交量阈值已更新为 {val:.1f}M USDT",
+            reply_markup=get_main_keyboard()
+        )
+    except ValueError:
+        await update.message.reply_text("⚠️ 请输入有效数字", reply_markup=get_main_keyboard())
+
 async def setvolatility(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global VOLATILITY_THRESHOLD
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
@@ -1365,7 +1533,7 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = "❌ 未获取到BTC数据"
     await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
-# ==================== Telegram Bot 启动 ====================
+# ==================== Telegram Bot ====================
 def run_telegram_bot():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -1378,6 +1546,7 @@ def run_telegram_bot():
     app.add_handler(CommandHandler("removecoin", removecoin))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("setdiff", setdiff))
+    app.add_handler(CommandHandler("setvol", setvol))
     app.add_handler(CommandHandler("setvolatility", setvolatility))
     app.add_handler(CommandHandler("sentiment", sentiment))
     app.add_handler(CommandHandler("debug", debug))
