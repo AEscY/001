@@ -37,6 +37,11 @@ VOLUME_THRESHOLD = 1000000
 ALERT_COOLDOWN = 120
 SUMMARY_MIN_DIFF = 0.3
 
+# ==================== 自适应阈值配置 ====================
+ATR_ADJUST_FACTOR = 0.5        # ATR比率调整因子 (0~1)，值越大调整幅度越大
+ZSCORE_MIN = 1.0                # 最低阈值
+ZSCORE_MAX = 2.5                # 最高阈值
+
 # ==================== 前瞻性引擎配置 ====================
 WHALE_VOLUME_THRESHOLD = 3.0       # 成交量暴增倍数
 RISK_PER_TRADE = 0.02              # 单笔风险占资金比例（2%）
@@ -704,6 +709,50 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
             score -= 20; details.append(f"基差{premium:+.2f}%空头拥挤 -20")
         else:
             details.append(f"基差{premium:+.2f}%正常")
+            
+            def get_dynamic_zscore_threshold(symbol, direction):
+    """根据ATR比率动态计算Z-Score阈值"""
+    atr_ratio = get_atr_ratio(symbol)
+    if direction == "LONG":
+        base = ZSCORE_BASE_LONG
+    else:
+        base = abs(ZSCORE_BASE_SHORT)
+    # 调整：ATR比率高（趋势强）放宽阈值，低（震荡）收紧
+    dynamic = base * (1 + (atr_ratio - 1) * ATR_ADJUST_FACTOR)
+    # 限制范围
+    if direction == "LONG":
+        return min(max(dynamic, ZSCORE_MIN), ZSCORE_MAX)
+    else:
+        return -min(max(dynamic, ZSCORE_MIN), ZSCORE_MAX)
+
+def get_orderbook_imbalance(symbol):
+    """计算订单簿不平衡评分 (-15 ~ +15)"""
+    try:
+        url = f"https://www.okx.com/api/v5/market/books?instId={symbol}&sz=10"
+        resp = requests.get(url, timeout=3)
+        data = resp.json()
+        if data["code"] != "0" or not data["data"]:
+            return 0
+        bids = data["data"][0]["bids"]
+        asks = data["data"][0]["asks"]
+        bid_vol = sum(float(b[1]) for b in bids)
+        ask_vol = sum(float(a[1]) for a in asks)
+        total = bid_vol + ask_vol
+        if total == 0:
+            return 0
+        imbalance = (bid_vol - ask_vol) / total  # -1 ~ 1
+        return int(imbalance * 15)
+    except:
+        return 0
+
+# ---- 可选：历史验证统计（在 verify_loop 中记录） ----
+def update_signal_history(score, success):
+    """记录信号验证结果，最多50条"""
+    global SIGNAL_HISTORY
+    with STATS_LOCK:
+        SIGNAL_HISTORY.append({"score": score, "success": success})
+        if len(SIGNAL_HISTORY) > 50:
+            SIGNAL_HISTORY.pop(0)
 
     # ========== 前瞻性引擎因子 ==========
     # 8. 鲸鱼追踪（成交量异动）
