@@ -651,7 +651,7 @@ def run_telegram_bot():
     app.add_handler(CommandHandler("removecoin", removecoin))
     app.add_handler(CommandHandler("clear", clear))
     print("🤖 Telegram Bot 已启动")
-    app.run_polling()
+    app.run_polling(signal_handlers=False)
 
 # ==================== 12. Flask心跳 ====================
 flask_app = Flask(__name__)
