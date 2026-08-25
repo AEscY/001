@@ -10,7 +10,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==================== 版本信息 ====================
-VERSION = "1.5.0"
+VERSION = "1.5.1"  # 修复 priceChangePercent 字段
 
 # ==================== 配置区（从环境变量读取） ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -40,7 +40,7 @@ STATS_LOCK = threading.Lock()
 
 # ==================== 自动过滤配置 ====================
 AUTO_FILTER_ENABLED = True
-MAX_COINS = 200                      # 已从 150 调整为 200
+MAX_COINS = 200
 FILTER_INTERVAL = 1800
 
 # ==================== 波动扫描配置 ====================
@@ -363,9 +363,13 @@ def on_message(ws, message):
             inst_id = item.get("instId", "")
             if inst_id not in price_data:
                 continue
-            price_data[inst_id]["price"] = float(item.get("last", 0))
-            price_data[inst_id]["change"] = float(item.get("idxPx", 0))
-            price_data[inst_id]["volume"] = float(item.get("vol24h", 0))
+            # 修复：使用 priceChangePercent 而非 idxPx
+            price = float(item.get("last", 0))
+            change = float(item.get("priceChangePercent", 0))
+            volume = float(item.get("vol24h", 0))
+            price_data[inst_id]["price"] = price
+            price_data[inst_id]["change"] = change
+            price_data[inst_id]["volume"] = volume
         check_divergence()
     except Exception as e:
         print(f"解析错误: {e}")
