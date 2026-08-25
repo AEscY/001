@@ -1,4 +1,7 @@
 import os
+import hmac
+import base64
+import hashlib
 import websocket
 import json
 import requests
@@ -10,14 +13,14 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==================== 版本信息 ====================
-VERSION = "1.9.2"  # 修复：Bot 移至主线程，Flask 移至子线程
+VERSION = "1.10.1"  # 新增：只读 API 动态获取 USDT 余额
 
 # ==================== 配置区 ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-    print("⚠️ 警告: TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未设置，Bot将无法启动")
+    print("⚠️ 警告: TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未设置")
 
 BTC_SYMBOL = "BTC-USDT"
 DEFAULT_ALT_SYMBOLS = ["ETH-USDT", "SOL-USDT", "BNB-USDT", "ADA-USDT", "DOGE-USDT", "XRP-USDT"]
@@ -41,8 +44,11 @@ ZSCORE_MIN = 1.0
 ZSCORE_MAX = 2.5
 WHALE_VOLUME_THRESHOLD = 3.0
 RISK_PER_TRADE = 0.02
-ACCOUNT_BALANCE = 10000
+ACCOUNT_BALANCE = 10000  # 当 API 获取失败时的默认值
 PRICE_TRAP_THRESHOLD = 0.005
+
+# ==================== v1.10.0 配置 ====================
+OI_CHANGE_THRESHOLD = 10.0
 
 # ==================== 验证配置 ====================
 VERIFY_MINUTES = 15
@@ -85,6 +91,10 @@ auto_refresh_interval = 300
 auto_refresh_timer = None
 price_candle_cache = {}
 
+# 缓存 USDT 余额，减少 API 调用
+usdt_balance_cache = {"balance": 0, "timestamp": 0, "valid": False}
+BALANCE_CACHE_TTL = 300  # 5 秒缓存
+
 # ==================== 菜单键盘 ====================
 def get_main_keyboard():
     buttons = [
@@ -111,6 +121,72 @@ def send_telegram(msg, parse_mode=None):
         requests.post(url, json=payload, timeout=5)
     except Exception as e:
         print(f"推送失败: {e}")
+
+# ==================== OKX API 签名工具（只读） ====================
+def generate_sign(timestamp, method, request_path, body, secret_key):
+    message = timestamp + method + request_path + body
+    mac = hmac.new(
+        bytes(secret_key, encoding='utf8'),
+        bytes(message, encoding='utf-8'),
+        hashlib.sha256
+    )
+    return base64.b64encode(mac.digest()).decode('utf-8')
+
+def get_usdt_balance():
+    """
+    使用只读 API 获取 USDT 可用余额
+    若未配置 API 或请求失败，返回 ACCOUNT_BALANCE
+    """
+    global usdt_balance_cache
+
+    api_key = os.environ.get("OKX_API_KEY")
+    secret_key = os.environ.get("OKX_SECRET_KEY")
+    passphrase = os.environ.get("OKX_PASSPHRASE")
+
+    # 未配置 API，返回默认值
+    if not api_key or not secret_key or not passphrase:
+        return ACCOUNT_BALANCE
+
+    # 检查缓存是否有效（TTL 5秒）
+    now = time.time()
+    if usdt_balance_cache["valid"] and (now - usdt_balance_cache["timestamp"]) < BALANCE_CACHE_TTL:
+        return usdt_balance_cache["balance"]
+
+    try:
+        timestamp = str(int(time.time()))
+        method = "GET"
+        request_path = "/api/v5/account/balance?ccy=USDT"
+        url = "https://www.okx.com" + request_path
+
+        sign = generate_sign(timestamp, method, request_path, "", secret_key)
+
+        headers = {
+            "OK-ACCESS-KEY": api_key,
+            "OK-ACCESS-SIGN": sign,
+            "OK-ACCESS-TIMESTAMP": timestamp,
+            "OK-ACCESS-PASSPHRASE": passphrase,
+            "Content-Type": "application/json",
+        }
+
+        resp = requests.get(url, headers=headers, timeout=5)
+        data = resp.json()
+
+        if data["code"] == "0":
+            for detail in data["data"][0]["details"]:
+                if detail["ccy"] == "USDT":
+                    balance = float(detail.get("availBal", 0))
+                    # 更新缓存
+                    usdt_balance_cache["balance"] = balance
+                    usdt_balance_cache["timestamp"] = now
+                    usdt_balance_cache["valid"] = True
+                    return balance
+
+        # 请求失败，返回默认值
+        return ACCOUNT_BALANCE
+
+    except Exception as e:
+        print(f"⚠️ 获取USDT余额失败: {e}")
+        return ACCOUNT_BALANCE
 
 # ==================== 基础工具函数 ====================
 def get_swap_symbols():
@@ -205,6 +281,39 @@ def get_atr_percent(symbol, period=14):
     except:
         return 0.5
 
+# ==================== v1.10.0 持仓量相关 ====================
+def get_open_interest(symbol):
+    try:
+        swap_symbol = symbol.replace("-USDT", "-USDT-SWAP")
+        url = f"https://www.okx.com/api/v5/public/open-interest?instId={swap_symbol}"
+        resp = requests.get(url, timeout=5)
+        data = resp.json()
+        if data["code"] == "0" and data["data"]:
+            return float(data["data"][0]["oi"])
+        return 0.0
+    except:
+        return 0.0
+
+oi_cache = {}
+
+def get_oi_change(symbol):
+    try:
+        current_oi = get_open_interest(symbol)
+        if current_oi == 0:
+            return 0.0, False
+        now = time.time()
+        if symbol in oi_cache:
+            prev_time, prev_oi = oi_cache[symbol]
+            if now - prev_time < 86400:
+                change_pct = (current_oi - prev_oi) / prev_oi * 100
+                significant = abs(change_pct) >= OI_CHANGE_THRESHOLD
+                return change_pct, significant
+        oi_cache[symbol] = (now, current_oi)
+        return 0.0, False
+    except:
+        return 0.0, False
+
+# ==================== 全面感知函数 ====================
 def get_market_sentiment():
     try:
         main_coins = ["BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT"]
@@ -472,7 +581,13 @@ def get_liquidity_trap_score(symbol, current_price):
     except:
         return 0, ""
 
-def calculate_position(current_price, atr_pct, score, account_balance=ACCOUNT_BALANCE):
+def calculate_position(current_price, atr_pct, score, account_balance=None):
+    """
+    计算建议合约张数
+    若 account_balance 为 None，则通过只读 API 动态获取 USDT 余额
+    """
+    if account_balance is None:
+        account_balance = get_usdt_balance()
     if atr_pct <= 0:
         atr_pct = 0.5
     stop_loss_pct = atr_pct * 1.5
@@ -783,6 +898,24 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
     entry_advice = get_rsi_entry_advice(symbol, signal_type)
     details.append(f"入场建议：{entry_advice}")
 
+    # ==================== v1.10.0 持仓量变化因子 ====================
+    oi_change, oi_sig = get_oi_change(symbol)
+    if signal_type == "LONG" and oi_sig and oi_change > 0:
+        score += 10
+        details.append(f"持仓量增加 {oi_change:+.1f}% (+10)")
+    elif signal_type == "LONG" and oi_sig and oi_change < 0:
+        score -= 10
+        details.append(f"持仓量减少 {oi_change:+.1f}% (-10)")
+    elif signal_type == "SHORT" and oi_sig and oi_change < 0:
+        score += 10
+        details.append(f"持仓量减少 {oi_change:+.1f}% (+10)")
+    elif signal_type == "SHORT" and oi_sig and oi_change > 0:
+        score -= 10
+        details.append(f"持仓量增加 {oi_change:+.1f}% (-10)")
+    else:
+        details.append(f"持仓量变化 {oi_change:+.1f}% (中性)")
+
+    # ---- 盈亏比 & 仓位（动态余额） ----
     atr_pct = get_atr_percent(symbol)
     if signal_type == "LONG":
         sl = current_price * (1 - atr_pct * 1.5 / 100)
@@ -795,7 +928,9 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
         rr = (current_price - tp) / (sl - current_price) if (sl - current_price) > 0 else 0
         details.append(f"止损 {sl:.4f} 止盈 {tp:.4f} 盈亏比 {rr:.1f}:1")
 
-    position_size = calculate_position(current_price, atr_pct, score)
+    # 使用动态余额计算仓位
+    balance = get_usdt_balance()
+    position_size = calculate_position(current_price, atr_pct, score, balance)
     details.append(f"建议仓位：{position_size} 张 (风险{RISK_PER_TRADE*100:.1f}%)")
 
     final_score = max(0, min(100, score))
@@ -1327,7 +1462,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         f"🤖 **合约胜率增强Bot v{VERSION}**\n"
-        "自适应阈值 + 订单簿不平衡 + 历史验证统计\n\n"
+        "自适应阈值 + 订单簿不平衡 + 持仓量变化 + 动态余额\n\n"
         "📊 **命令**：\n"
         "/status – 状态 & 参数\n"
         "/summary – 强弱汇总\n"
@@ -1368,6 +1503,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sentiment = get_market_sentiment()
     dyn_long = get_dynamic_zscore_threshold("BTC-USDT", "LONG")
     dyn_short = get_dynamic_zscore_threshold("BTC-USDT", "SHORT")
+    balance = get_usdt_balance()
     msg = (
         f"📋 监控: {count} 个山寨币（仅合约）\n"
         f"自动刷新: {status_auto}"
@@ -1376,6 +1512,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"波动扫描: {volatility_status} (阈值 {VOLATILITY_THRESHOLD}%)\n"
         f"独立行情: {independent_status} (阈值 {INDEPENDENT_THRESHOLD}%)\n"
         f"待验证信号: {pending_count} 个\n"
+        f"💰 USDT余额: ${balance:,.2f}\n"
         f"📊 近24小时验证统计:\n"
         f"  总数: {total} | ✅成功: {success} | ❌失败: {failed} | ⏳失效: {expired}\n"
         f"  成功率: {success_rate}\n"
@@ -1580,11 +1717,13 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     btc = price_data.get(BTC_SYMBOL)
     if btc:
+        balance = get_usdt_balance()
         msg = (f"🔍 **BTC 当前数据**\n"
                f"价格: ${btc['price']:.2f}\n"
                f"24h涨跌幅: {btc['change']:.2f}%\n"
                f"成交额: ${btc['volume']:.0f}\n"
                f"监控币种总数: {len(alt_symbols)}\n"
+               f"💰 USDT余额: ${balance:,.2f}\n"
                f"历史样本数: {sum(len(v) for v in diff_history.values())}")
     else:
         msg = "❌ 未获取到BTC数据"
@@ -1635,25 +1774,26 @@ def run_http():
 def send_startup_notification():
     time.sleep(8)
     sentiment_val = get_market_sentiment()
+    balance = get_usdt_balance()
     msg = (
         f"🚀 **Bot 已重新启动！**\n"
         f"版本: {VERSION}\n"
         f"启动时间: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
         f"监控币种: {len(alt_symbols)} 个合约币种\n"
+        f"💰 USDT余额: ${balance:,.2f}\n"
         f"市场情绪: {sentiment_val}/100\n"
         f"动态阈值: 多 {get_dynamic_zscore_threshold('BTC-USDT', 'LONG'):.2f} / 空 {get_dynamic_zscore_threshold('BTC-USDT', 'SHORT'):.2f}\n"
         f"使用 /status 查看详情"
     )
     send_telegram(msg)
 
-# ==================== 主程序（修复：Bot在主线程，Flask在子线程） ====================
+# ==================== 主程序 ====================
 if __name__ == "__main__":
     print(f"🚀 合约胜率增强版 v{VERSION} 启动于 {datetime.now(timezone.utc)}")
     print(f"初始监控: {BTC_SYMBOL} + {', '.join(DEFAULT_ALT_SYMBOLS)}")
     print(f"基础 Z-Score 阈值: 多 {ZSCORE_BASE_LONG} / 空 {ZSCORE_BASE_SHORT}")
     print(f"自动过滤: 保留前 {MAX_COINS} 名")
 
-    # ---- 所有后台线程（验证、扫描、WebSocket等） ----
     threading.Thread(target=verify_loop, daemon=True).start()
     threading.Thread(target=auto_scan_new_coins, daemon=True).start()
     threading.Thread(target=auto_filter_coins, daemon=True).start()
@@ -1661,13 +1801,10 @@ if __name__ == "__main__":
     threading.Thread(target=independent_scanner, daemon=True).start()
     threading.Thread(target=start_ws, daemon=True).start()
 
-    # ---- Flask 放在子线程（避免阻塞主线程） ----
     http_thread = threading.Thread(target=run_http, daemon=True)
     http_thread.start()
 
-    # ---- 启动通知放在子线程 ----
     threading.Thread(target=send_startup_notification, daemon=True).start()
 
-    # ---- Telegram Bot 放在主线程（解决信号处理器冲突） ----
     print("🤖 正在主线程启动 Telegram Bot...")
     run_telegram_bot()
