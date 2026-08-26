@@ -13,7 +13,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==================== 版本信息 ====================
-VERSION = "1.10.1"  # 新增：只读 API 动态获取 USDT 余额
+VERSION = "1.10.2"  # 增强余额刷新 + 手动刷新命令 + 冲突修复
 
 # ==================== 配置区 ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -91,9 +91,9 @@ auto_refresh_interval = 300
 auto_refresh_timer = None
 price_candle_cache = {}
 
-# 缓存 USDT 余额，减少 API 调用
+# 缓存 USDT 余额，减少 API 调用（TTL 60 秒）
 usdt_balance_cache = {"balance": 0, "timestamp": 0, "valid": False}
-BALANCE_CACHE_TTL = 300  # 5 秒缓存
+BALANCE_CACHE_TTL = 60  # 60 秒缓存，平衡实时性与 API 频率
 
 # ==================== 菜单键盘 ====================
 def get_main_keyboard():
@@ -103,8 +103,8 @@ def get_main_keyboard():
         [KeyboardButton("/addcoin"), KeyboardButton("/addtop")],
         [KeyboardButton("/removecoin"), KeyboardButton("/clear")],
         [KeyboardButton("/setdiff"), KeyboardButton("/setvol")],
-        [KeyboardButton("/setvolatility"), KeyboardButton("/sentiment"), KeyboardButton("/debug")],
-        [KeyboardButton("/help")]
+        [KeyboardButton("/setvolatility"), KeyboardButton("/sentiment")],
+        [KeyboardButton("/debug"), KeyboardButton("/refreshbalance"), KeyboardButton("/help")]
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
 
@@ -132,9 +132,10 @@ def generate_sign(timestamp, method, request_path, body, secret_key):
     )
     return base64.b64encode(mac.digest()).decode('utf-8')
 
-def get_usdt_balance():
+def get_usdt_balance(force_refresh=False):
     """
     使用只读 API 获取 USDT 可用余额
+    若 force_refresh=True，强制重新请求并更新缓存
     若未配置 API 或请求失败，返回 ACCOUNT_BALANCE
     """
     global usdt_balance_cache
@@ -145,11 +146,12 @@ def get_usdt_balance():
 
     # 未配置 API，返回默认值
     if not api_key or not secret_key or not passphrase:
+        print("⚠️ OKX API 密钥未配置，使用默认余额")
         return ACCOUNT_BALANCE
 
-    # 检查缓存是否有效（TTL 5秒）
+    # 检查缓存是否有效（除非强制刷新）
     now = time.time()
-    if usdt_balance_cache["valid"] and (now - usdt_balance_cache["timestamp"]) < BALANCE_CACHE_TTL:
+    if not force_refresh and usdt_balance_cache["valid"] and (now - usdt_balance_cache["timestamp"]) < BALANCE_CACHE_TTL:
         return usdt_balance_cache["balance"]
 
     try:
@@ -171,22 +173,36 @@ def get_usdt_balance():
         resp = requests.get(url, headers=headers, timeout=5)
         data = resp.json()
 
-        if data["code"] == "0":
+        # 调试日志（可在 Render 日志中查看）
+        print(f"📦 API 响应状态码: {resp.status_code}")
+        print(f"📦 API 响应内容: {data}")
+
+        if data.get("code") == "0":
+            # 解析 USDT 余额（availBal）
             for detail in data["data"][0]["details"]:
                 if detail["ccy"] == "USDT":
                     balance = float(detail.get("availBal", 0))
-                    # 更新缓存
                     usdt_balance_cache["balance"] = balance
                     usdt_balance_cache["timestamp"] = now
                     usdt_balance_cache["valid"] = True
+                    print(f"✅ 获取USDT余额成功: {balance}")
                     return balance
-
-        # 请求失败，返回默认值
-        return ACCOUNT_BALANCE
+            # 如果找不到 USDT，返回 0
+            print("⚠️ 响应中未找到 USDT 余额")
+            return 0.0
+        else:
+            print(f"⚠️ API 返回错误: {data.get('msg', '未知错误')}")
+            return ACCOUNT_BALANCE
 
     except Exception as e:
-        print(f"⚠️ 获取USDT余额失败: {e}")
+        print(f"⚠️ 获取USDT余额异常: {e}")
         return ACCOUNT_BALANCE
+
+def refresh_balance_cache():
+    """强制刷新余额缓存"""
+    global usdt_balance_cache
+    usdt_balance_cache["valid"] = False
+    return get_usdt_balance(force_refresh=True)
 
 # ==================== 基础工具函数 ====================
 def get_swap_symbols():
@@ -928,7 +944,7 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
         rr = (current_price - tp) / (sl - current_price) if (sl - current_price) > 0 else 0
         details.append(f"止损 {sl:.4f} 止盈 {tp:.4f} 盈亏比 {rr:.1f}:1")
 
-    # 使用动态余额计算仓位
+    # 使用动态余额计算仓位（若缓存过期会自动刷新）
     balance = get_usdt_balance()
     position_size = calculate_position(current_price, atr_pct, score, balance)
     details.append(f"建议仓位：{position_size} 张 (风险{RISK_PER_TRADE*100:.1f}%)")
@@ -1473,6 +1489,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/setvolatility – 波动扫描阈值\n"
         "/sentiment – 市场情绪指数\n"
         "/debug – BTC数据\n"
+        "/refreshbalance – 强制刷新USDT余额\n"
         "/help – 此帮助",
         reply_markup=get_main_keyboard(),
         parse_mode='Markdown'
@@ -1503,7 +1520,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sentiment = get_market_sentiment()
     dyn_long = get_dynamic_zscore_threshold("BTC-USDT", "LONG")
     dyn_short = get_dynamic_zscore_threshold("BTC-USDT", "SHORT")
-    balance = get_usdt_balance()
+    balance = get_usdt_balance()  # 可能使用缓存
     msg = (
         f"📋 监控: {count} 个山寨币（仅合约）\n"
         f"自动刷新: {status_auto}"
@@ -1729,6 +1746,14 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = "❌ 未获取到BTC数据"
     await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
+async def refreshbalance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """手动强制刷新 USDT 余额"""
+    if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
+        return
+    await update.message.reply_text("🔄 正在刷新 USDT 余额...", reply_markup=get_main_keyboard())
+    balance = refresh_balance_cache()
+    await update.message.reply_text(f"✅ 余额已刷新: ${balance:,.2f}", reply_markup=get_main_keyboard())
+
 # ==================== Telegram Bot ====================
 def run_telegram_bot():
     try:
@@ -1751,8 +1776,10 @@ def run_telegram_bot():
         app.add_handler(CommandHandler("setvolatility", setvolatility))
         app.add_handler(CommandHandler("sentiment", sentiment))
         app.add_handler(CommandHandler("debug", debug))
+        app.add_handler(CommandHandler("refreshbalance", refreshbalance))
         print("🤖 Telegram Bot 正在运行")
-        app.run_polling()
+        # 添加 drop_pending_updates 解决冲突
+        app.run_polling(drop_pending_updates=True)
     except Exception as e:
         print(f"❌ Telegram Bot 启动失败: {e}")
         import traceback
