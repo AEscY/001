@@ -1065,13 +1065,14 @@ def verify_loop():
                             with STATS_LOCK:
                                 VERIFY_STATS["total"] += 1
                                 VERIFY_STATS["success"] += 1
-                            update_signal_history(signal['score'], True)
+                            # 使用 .get() 防止 KeyError
+                            update_signal_history(signal.get('score', 0), True)
                         else:
                             signal["status"] = "failed"
                             with STATS_LOCK:
                                 VERIFY_STATS["total"] += 1
                                 VERIFY_STATS["failed"] += 1
-                            update_signal_history(signal['score'], False)
+                            update_signal_history(signal.get('score', 0), False)
                     else:
                         signal["status"] = "expired"
                         with STATS_LOCK:
