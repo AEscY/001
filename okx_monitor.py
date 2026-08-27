@@ -144,18 +144,17 @@ def get_usdt_balance(force_refresh=False):
     secret_key = os.environ.get("OKX_SECRET_KEY")
     passphrase = os.environ.get("OKX_PASSPHRASE")
 
-    # 未配置 API，返回默认值
     if not api_key or not secret_key or not passphrase:
         print("⚠️ OKX API 密钥未配置，使用默认余额")
         return ACCOUNT_BALANCE
 
-    # 检查缓存是否有效（除非强制刷新）
     now = time.time()
     if not force_refresh and usdt_balance_cache["valid"] and (now - usdt_balance_cache["timestamp"]) < BALANCE_CACHE_TTL:
         return usdt_balance_cache["balance"]
 
     try:
-        timestamp = str(int(time.time()))
+        # 生成 ISO 8601 时间戳（带毫秒和 Z）
+        timestamp = datetime.now(timezone.utc).isoformat(timespec='milliseconds') + 'Z'
         method = "GET"
         request_path = "/api/v5/account/balance?ccy=USDT"
         url = "https://www.okx.com" + request_path
@@ -173,12 +172,10 @@ def get_usdt_balance(force_refresh=False):
         resp = requests.get(url, headers=headers, timeout=5)
         data = resp.json()
 
-        # 调试日志（可在 Render 日志中查看）
         print(f"📦 API 响应状态码: {resp.status_code}")
         print(f"📦 API 响应内容: {data}")
 
         if data.get("code") == "0":
-            # 解析 USDT 余额（availBal）
             for detail in data["data"][0]["details"]:
                 if detail["ccy"] == "USDT":
                     balance = float(detail.get("availBal", 0))
@@ -187,7 +184,6 @@ def get_usdt_balance(force_refresh=False):
                     usdt_balance_cache["valid"] = True
                     print(f"✅ 获取USDT余额成功: {balance}")
                     return balance
-            # 如果找不到 USDT，返回 0
             print("⚠️ 响应中未找到 USDT 余额")
             return 0.0
         else:
