@@ -14,7 +14,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==================== 版本信息 ====================
-VERSION = "2.1.0"  # 集成免费数据源：DeFi Llama + BRK + OKX公开数据
+VERSION = "2.1.0"  # 集成免费数据源 + 自定义评分阈值命令
 
 # ==================== 配置区 ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -82,6 +82,9 @@ SCORE_FUNDING_TREND = 10
 SCORE_TREND_BONUS = 25
 SCORE_NEUTRAL_PENALTY = -10
 
+# ==================== 自定义评分阈值（新增） ====================
+MIN_SCORE_THRESHOLD = 50   # 可通过 /setthreshold 命令动态调整
+
 # ==================== 验证配置 ====================
 VERIFY_MINUTES = 15
 VERIFY_PRICE_CHANGE_PCT = 0.8
@@ -143,8 +146,9 @@ def get_main_keyboard():
         [KeyboardButton("/removecoin"), KeyboardButton("/clear")],
         [KeyboardButton("/setdiff"), KeyboardButton("/setvol")],
         [KeyboardButton("/setvolatility"), KeyboardButton("/setleverage")],
-        [KeyboardButton("/sentiment"), KeyboardButton("/debug")],
-        [KeyboardButton("/refreshbalance"), KeyboardButton("/help")]
+        [KeyboardButton("/setthreshold"), KeyboardButton("/sentiment")],
+        [KeyboardButton("/debug"), KeyboardButton("/refreshbalance")],
+        [KeyboardButton("/help")]
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
 
@@ -230,12 +234,10 @@ def get_stablecoin_data():
         return data_cache[cache_key]["data"]
 
     try:
-        # DeFi Llama 稳定币数据接口
         url = "https://stablecoins.llama.fi/stablecoinoverview"
         resp = requests.get(url, timeout=10)
         data = resp.json()
         if data:
-            # 提取 USDT 和 USDC 市值
             usdt_mcap = 0
             usdc_mcap = 0
             for item in data.get("peggedAssets", []):
@@ -260,12 +262,10 @@ def get_brk_exchange_balance():
         return data_cache[cache_key]["data"]
 
     try:
-        # BRK 公共API端点
         url = "https://api.bitview.space/v1/exchange/balance"
         resp = requests.get(url, timeout=10)
         data = resp.json()
         if data and "balance" in data:
-            # 计算24h变化
             if len(data.get("history", [])) >= 2:
                 curr = data["history"][-1]
                 prev = data["history"][-2]
@@ -280,45 +280,30 @@ def get_brk_exchange_balance():
         print(f"获取BRK交易所余额失败: {e}")
         return {"balance": 0, "change": 0}
 
-# ----- 3. OKX 公开数据：大单净流向（模拟） -----
+# ----- 3. OKX 公开数据：大单净流向（占位） -----
 def get_whale_net_flow():
-    """
-    获取大单净流向
-    真实实现需要解析 OKX WebSocket 逐笔成交数据
-    此处为占位，未来可扩展
-    """
-    # 由于逐笔成交 WebSocket 解析较复杂，暂时返回 0
-    # 未来可通过集成 OKX 的 trades 频道实现
+    # 真实实现需解析 OKX WebSocket 逐笔成交数据，此处占位
     return 0
 
-# ----- 4. OKX 公开数据：多空比变化 -----
+# ----- 4. OKX 公开数据：多空比变化（占位） -----
 def get_lsr_change():
-    """
-    获取多空比变化
-    OKX 公开接口不直接提供多空比，但可通过持仓量间接估算
-    此处为占位，返回 0
-    """
-    # 真实实现：需通过 OKX 账户持仓量数据计算多头/空头比例
-    # 因公开接口限制，暂时返回 0
+    # 真实实现需通过持仓量估算，此处占位
     return 0
 
 # ----- 5. Coinbase 溢价（免费） -----
 def get_coinbase_premium():
-    """计算 Coinbase 溢价（Coinbase BTC价格 vs OKX BTC价格）"""
     cache_key = "coinbase_premium"
     now = time.time()
     if cache_key in data_cache and (now - data_cache[cache_key]["timestamp"]) < CACHE_TTL:
         return data_cache[cache_key]["data"]
 
     try:
-        # Coinbase 现货价格
         cb_url = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
         cb_resp = requests.get(cb_url, timeout=5)
         cb_data = cb_resp.json()
         if "data" not in cb_data:
             return 0.0
         cb_price = float(cb_data["data"]["amount"])
-        # OKX 现货价格
         okx_url = "https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT"
         okx_resp = requests.get(okx_url, timeout=5)
         okx_data = okx_resp.json()
@@ -334,7 +319,6 @@ def get_coinbase_premium():
 
 # ----- 6. 资金费率趋势 -----
 def get_funding_trend_score(symbol):
-    """资金费率趋势：近6次费率变化方向"""
     history = funding_history.get(symbol, [])
     if len(history) < 6:
         return 0
@@ -342,9 +326,9 @@ def get_funding_trend_score(symbol):
     diffs = [recent[i] - recent[i-1] for i in range(1, len(recent))]
     avg_change = sum(diffs) / len(diffs) if diffs else 0
     if avg_change > 0.0001:
-        return -1  # 费率上升，多头拥挤，看跌
+        return -1
     elif avg_change < -0.0001:
-        return 1   # 费率下降，空头拥挤，看涨
+        return 1
     else:
         return 0
 
@@ -952,7 +936,7 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
         score += trend_bonus
         details.append(f"趋势 {trend_text} {trend_bonus:+d}")
 
-    # 2. 大单净流向（占位，未来实现）
+    # 2. 大单净流向（占位）
     whale_net = get_whale_net_flow()
     if ENABLE_WHALE_TRACKING and whale_net != 0:
         if (signal_type == "LONG" and whale_net > 0) or (signal_type == "SHORT" and whale_net < 0):
@@ -962,7 +946,7 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
             score -= SCORE_WHALE // 2
             details.append(f"大单净流向 {whale_net:+.2f} BTC (-{SCORE_WHALE//2})")
 
-    # 3. 多空比变化（占位，未来实现）
+    # 3. 多空比变化（占位）
     lsr_change = get_lsr_change()
     if ENABLE_LSR_CHANGE and lsr_change != 0:
         if (signal_type == "LONG" and lsr_change < 0) or (signal_type == "SHORT" and lsr_change > 0):
@@ -975,7 +959,6 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
     # 4. 稳定币市值（DeFi Llama）
     stablecoin = get_stablecoin_data()
     if ENABLE_STABLECOIN_MONITOR and stablecoin["usdt"] > 0:
-        # 市值>1000亿美元视为资金充裕
         if stablecoin["usdt"] > 1000 and signal_type == "LONG":
             score += SCORE_STABLECOIN
             details.append(f"USDT市值 {stablecoin['usdt']:.0f}亿 (+{SCORE_STABLECOIN})")
@@ -1015,7 +998,7 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
             score -= SCORE_FUNDING_TREND // 2
             details.append(f"费率趋势看跌 (-{SCORE_FUNDING_TREND//2})")
 
-    # 8. RSI 辅助（保留）
+    # 8. RSI 辅助
     rsi = calculate_rsi(symbol)
     if signal_type == "LONG" and rsi < 30:
         score += 5
@@ -1056,7 +1039,7 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
     final_score = max(0, min(100, score))
     return signal_type, final_score, " | ".join(details)
 
-# ==================== 背离检测 ====================
+# ==================== 背离检测（使用动态阈值） ====================
 def check_divergence():
     btc = price_data[BTC_SYMBOL]
     btc_change = btc["change"]
@@ -1086,7 +1069,8 @@ def check_divergence():
         else:
             continue
 
-        if signal_type and score >= 50:
+        # 使用动态阈值判断是否推送
+        if signal_type and score >= MIN_SCORE_THRESHOLD:
             last_alert_time[sym] = now
             emoji = "🟢" if signal_type == "LONG" else "🔴"
             action = "做多" if signal_type == "LONG" else "做空"
@@ -1496,7 +1480,7 @@ def independent_scanner():
                         current_price=current_price,
                         use_independent=True
                     )
-                    if signal_type and score >= 50:
+                    if signal_type and score >= MIN_SCORE_THRESHOLD:
                         emoji = "🟢" if signal_type == "LONG" else "🔴"
                         action = "做多" if signal_type == "LONG" else "做空"
                         inst_id = symbol
@@ -1589,7 +1573,7 @@ def stop_auto_refresh():
         auto_refresh_timer.cancel()
         auto_refresh_timer = None
 
-# ==================== Telegram 命令 ====================
+# ==================== Telegram 命令（含新增 /setthreshold） ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
         return
@@ -1605,6 +1589,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/setvol – 成交量阈值\n"
         "/setvolatility – 波动扫描阈值\n"
         "/setleverage – 设置杠杆倍数\n"
+        "/setthreshold – 设置评分推送阈值（0~100）\n"
         "/sentiment – 市场情绪指数\n"
         "/debug – BTC数据\n"
         "/refreshbalance – 强制刷新余额\n"
@@ -1652,6 +1637,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"待验证信号: {pending_count} 个\n"
         f"💰 USDT余额: ${balance:,.2f}\n"
         f"⚡ 当前杠杆: {current_leverage}x\n"
+        f"🎯 评分推送阈值: {MIN_SCORE_THRESHOLD}\n"
         f"📊 近24小时验证统计:\n"
         f"  总数: {total} | ✅成功: {success} | ❌失败: {failed} | ⏳失效: {expired}\n"
         f"  成功率: {success_rate}\n"
@@ -1859,6 +1845,33 @@ async def setleverage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("⚠️ 请输入有效整数", reply_markup=get_main_keyboard())
 
+async def setthreshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """设置评分推送阈值（0~100），低于该值不推送"""
+    global MIN_SCORE_THRESHOLD
+    if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            f"📊 当前评分阈值: {MIN_SCORE_THRESHOLD}\n"
+            "用法: /setthreshold <数值>（如 /setthreshold 80）\n"
+            "范围: 0~100，低于阈值不推送信号",
+            reply_markup=get_main_keyboard()
+        )
+        return
+    try:
+        val = int(context.args[0])
+        if val < 0 or val > 100:
+            await update.message.reply_text("⚠️ 阈值范围应在 0~100 之间", reply_markup=get_main_keyboard())
+            return
+        MIN_SCORE_THRESHOLD = val
+        await update.message.reply_text(
+            f"✅ 评分推送阈值已更新为 {MIN_SCORE_THRESHOLD}\n"
+            f"（评分 >= {MIN_SCORE_THRESHOLD} 的信号才会推送）",
+            reply_markup=get_main_keyboard()
+        )
+    except ValueError:
+        await update.message.reply_text("⚠️ 请输入有效整数，如 /setthreshold 80", reply_markup=get_main_keyboard())
+
 async def sentiment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
         return
@@ -1892,6 +1905,7 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
                f"监控币种总数: {len(alt_symbols)}\n"
                f"💰 USDT余额: ${balance:,.2f}\n"
                f"⚡ 当前杠杆: {current_leverage}x\n"
+               f"🎯 评分推送阈值: {MIN_SCORE_THRESHOLD}\n"
                f"稳定币: USDT {stablecoin['usdt']:.0f}亿\n"
                f"Coinbase溢价: {premium:+.2f}%\n"
                f"交易所余额变化: {brk['change']:+.2f}%\n"
@@ -1928,6 +1942,7 @@ def run_telegram_bot():
         app.add_handler(CommandHandler("setvol", setvol))
         app.add_handler(CommandHandler("setvolatility", setvolatility))
         app.add_handler(CommandHandler("setleverage", setleverage))
+        app.add_handler(CommandHandler("setthreshold", setthreshold))
         app.add_handler(CommandHandler("sentiment", sentiment))
         app.add_handler(CommandHandler("debug", debug))
         app.add_handler(CommandHandler("refreshbalance", refreshbalance))
@@ -1964,6 +1979,7 @@ def send_startup_notification():
         f"监控币种: {len(alt_symbols)} 个合约币种\n"
         f"💰 USDT余额: ${balance:,.2f}\n"
         f"⚡ 当前杠杆: {current_leverage}x\n"
+        f"🎯 评分推送阈值: {MIN_SCORE_THRESHOLD}\n"
         f"市场情绪: {sentiment_val}/100\n"
         f"稳定币: USDT {stablecoin['usdt']:.0f}亿\n"
         f"Coinbase溢价: {premium:+.2f}%\n"
@@ -1981,6 +1997,7 @@ if __name__ == "__main__":
     print(f"默认杠杆: {DEFAULT_LEVERAGE}x")
     print(f"自动过滤: 保留前 {MAX_COINS} 名")
     print(f"趋势过滤: {'🟢 开启' if ENABLE_TREND_FILTER else '🔴 关闭'}")
+    print(f"评分推送阈值: {MIN_SCORE_THRESHOLD}")
     print("📊 数据源: OKX + DeFi Llama + BRK + Coinbase")
 
     threading.Thread(target=verify_loop, daemon=True).start()
