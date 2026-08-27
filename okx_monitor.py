@@ -14,7 +14,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==================== 版本信息 ====================
-VERSION = "2.2.2"  # 增强容错：稳定币和交易所余额数据源多重备份 + 重试机制
+VERSION = "3.4.0"  # 精简版：5个核心因子 + 独立触发 + 信号冷却
 
 # ==================== 配置区 ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -26,69 +26,32 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
 BTC_SYMBOL = "BTC-USDT"
 DEFAULT_ALT_SYMBOLS = ["ETH-USDT", "SOL-USDT", "BNB-USDT", "ADA-USDT", "DOGE-USDT", "XRP-USDT"]
 
-BTC_TREND_THRESHOLD = 0.3
-ZSCORE_BASE_LONG = 1.8
-ZSCORE_BASE_SHORT = -1.8
-MIN_ZSCORE_SAMPLES = 20
-FALLBACK_LONG = 0.6
-FALLBACK_SHORT = -0.6
+# ==================== 评分权重（5个核心因子） ====================
+WEIGHT_TREND = 40      # 自身趋势
+WEIGHT_DIVERGENCE = 30 # 背离差
+WEIGHT_VOLUME = 15     # 成交量
+WEIGHT_RSI = 10        # RSI
+WEIGHT_FUNDING = 5     # 资金费率
 
+SCORE_THRESHOLD_HIGH = 70    # 高置信度
+SCORE_THRESHOLD_MEDIUM = 50  # 中等置信度（低于此不推送）
+
+# ==================== 信号冷却配置 ====================
+COOLDOWN_HOURS = 24          # 同币种同方向冷却时间（小时）
+
+# ==================== 基础参数 ====================
 RSI_OVERBOUGHT = 70
 RSI_OVERSOLD = 30
-VOLUME_THRESHOLD = 1000000
+VOLUME_THRESHOLD = 1000000   # 100万 USDT
 ALERT_COOLDOWN = 120
 SUMMARY_MIN_DIFF = 0.3
 
-# ==================== v1.x 保留配置 ====================
-ATR_ADJUST_FACTOR = 0.5
-ZSCORE_MIN = 1.0
-ZSCORE_MAX = 2.5
-WHALE_VOLUME_THRESHOLD = 3.0
+# ==================== 风控参数 ====================
 RISK_PER_TRADE = 0.02
 ACCOUNT_BALANCE = 0
-PRICE_TRAP_THRESHOLD = 0.005
-OI_CHANGE_THRESHOLD = 10.0
 DEFAULT_LEVERAGE = 3
-LIQUIDATION_LOOKBACK = 24
-FUNDING_HISTORY_LENGTH = 24
-
-BIAS_LONG_MAX = 8.0
-BIAS_SHORT_MIN = -8.0
-BIAS_LONG_WARN = 5.0
-BIAS_SHORT_WARN = -5.0
-RSI_EXTREME_OVERBOUGHT = 75
-RSI_EXTREME_OVERSOLD = 25
-VOLUME_CONFIRM_RATIO = 1.5
-
-# ==================== v2.0/v2.1 评分配置 ====================
-ENABLE_TREND_FILTER = True
-ENABLE_WHALE_TRACKING = True
-ENABLE_LSR_CHANGE = True
-ENABLE_STABLECOIN_MONITOR = True
-ENABLE_COINBASE_PREMIUM = True
-ENABLE_EXCHANGE_BALANCE = True
-
-SCORE_BASE = 50
-SCORE_WHALE = 20
-SCORE_LSR = 15
-SCORE_STABLECOIN = 10
-SCORE_COINBASE = 15
-SCORE_BALANCE = 10
-SCORE_FUNDING_TREND = 10
-SCORE_TREND_BONUS = 25
-SCORE_NEUTRAL_PENALTY = -10
-
-# ==================== v2.2.0 新增配置（动量突破） ====================
-ENABLE_MOMENTUM_BREAKOUT = True
-MOMENTUM_15MIN_THRESHOLD = 2.0
-MOMENTUM_VOLUME_RATIO = 5.0
-NEW_HIGH_LOOKBACK = 20
-SCORE_MOMENTUM = 30
-SCORE_NEW_HIGH = 15
-SCORE_VOLUME_SPIKE = 10
-
-# ==================== 自定义评分阈值 ====================
-MIN_SCORE_THRESHOLD = 50
+ATR_STOP_MULTIPLIER = 1.5
+ATR_TAKE_MULTIPLIER = 2.5
 
 # ==================== 验证配置 ====================
 VERIFY_MINUTES = 15
@@ -109,11 +72,6 @@ VOLATILITY_SCAN_ENABLED = True
 VOLATILITY_THRESHOLD = 3.0
 VOLATILITY_SCAN_INTERVAL = 60
 
-# ==================== 独立行情 ====================
-INDEPENDENT_MODE_ENABLED = True
-INDEPENDENT_THRESHOLD = 3.0
-INDEPENDENT_LOOKBACK = 15
-
 # ==================== 全局状态 ====================
 alt_symbols = set(DEFAULT_ALT_SYMBOLS)
 price_data = {BTC_SYMBOL: {"price": 0, "change": 0, "volume": 0}}
@@ -121,7 +79,7 @@ for sym in alt_symbols:
     price_data[sym] = {"price": 0, "change": 0, "volume": 0}
 
 diff_history = {}
-last_alert_time = {}
+last_alert_time = {}          # 记录最后一次推送时间 {symbol: {"timestamp": 0, "direction": "LONG/SHORT"}}
 ws_instance = None
 ws_lock = threading.Lock()
 restart_flag = False
@@ -131,21 +89,12 @@ auto_refresh_interval = 300
 auto_refresh_timer = None
 price_candle_cache = {}
 
-# ---- v2.2.1 大单跟踪缓存 ----
-whale_trades_cache = {}  # {symbol: {"net_flow": 0, "timestamp": 0}}
-WHALE_TRACK_WINDOW = 300  # 5分钟窗口
-WHALE_SIZE_THRESHOLD = 5  # BTC 阈值，其他币种按价格换算
-
-momentum_cache = {}
 usdt_balance_cache = {"balance": 0, "timestamp": 0, "valid": False}
 BALANCE_CACHE_TTL = 60
 
 current_leverage = DEFAULT_LEVERAGE
-funding_history = {}
-liquidation_cache = {}
-
-data_cache = {}
-CACHE_TTL = 300
+funding_history = deque(maxlen=24)  # 仅用于当前费率，不计算标准差
+MIN_SCORE_THRESHOLD = 50            # 可通过 /setthreshold 调整
 
 # ==================== 菜单键盘 ====================
 def get_main_keyboard():
@@ -154,9 +103,7 @@ def get_main_keyboard():
         [KeyboardButton("/autorefresh on"), KeyboardButton("/autorefresh off")],
         [KeyboardButton("/addcoin"), KeyboardButton("/addtop")],
         [KeyboardButton("/removecoin"), KeyboardButton("/clear")],
-        [KeyboardButton("/setdiff"), KeyboardButton("/setvol")],
-        [KeyboardButton("/setvolatility"), KeyboardButton("/setleverage")],
-        [KeyboardButton("/setthreshold"), KeyboardButton("/sentiment")],
+        [KeyboardButton("/setthreshold"), KeyboardButton("/setleverage")],
         [KeyboardButton("/debug"), KeyboardButton("/refreshbalance")],
         [KeyboardButton("/help")]
     ]
@@ -233,311 +180,7 @@ def refresh_balance_cache():
     usdt_balance_cache["valid"] = False
     return get_usdt_balance(force_refresh=True)
 
-# ==================== v2.2.2 增强容错：稳定币数据（多重备份 + 重试） ====================
-def get_stablecoin_data():
-    """获取稳定币市值，增加重试和多数据源备份"""
-    cache_key = "stablecoin"
-    now = time.time()
-    if cache_key in data_cache and (now - data_cache[cache_key]["timestamp"]) < CACHE_TTL:
-        return data_cache[cache_key]["data"]
-
-    # 数据源列表（按优先级排序）
-    sources = [
-        {"name": "DeFi Llama", "url": "https://stablecoins.llama.fi/stablecoinoverview"},
-        {"name": "CoinGecko", "url": "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=tether,usd-coin&order=market_cap_desc&per_page=100&page=1&sparkline=false"},
-    ]
-
-    for source in sources:
-        for attempt in range(3):
-            try:
-                resp = requests.get(source["url"], timeout=10)
-                data = resp.json()
-                if not data:
-                    continue
-
-                usdt_mcap, usdc_mcap = 0, 0
-                if source["name"] == "DeFi Llama":
-                    for item in data.get("peggedAssets", []):
-                        if item.get("symbol") == "USDT":
-                            usdt_mcap = item.get("circulating", {}).get("peggedUSD", 0) / 1e8
-                        elif item.get("symbol") == "USDC":
-                            usdc_mcap = item.get("circulating", {}).get("peggedUSD", 0) / 1e8
-                elif source["name"] == "CoinGecko":
-                    for coin in data:
-                        if coin.get("id") == "tether":
-                            usdt_mcap = coin.get("market_cap", 0) / 1e8
-                        elif coin.get("id") == "usd-coin":
-                            usdc_mcap = coin.get("market_cap", 0) / 1e8
-
-                if usdt_mcap > 0 or usdc_mcap > 0:
-                    result = {"usdt": usdt_mcap, "usdc": usdc_mcap}
-                    data_cache[cache_key] = {"data": result, "timestamp": now}
-                    print(f"✅ 稳定币数据获取成功，来源: {source['name']}")
-                    return result
-                else:
-                    print(f"⚠️ 从 {source['name']} 获取的数据为空，重试 {attempt+1}/3")
-                    time.sleep(2)
-            except Exception as e:
-                print(f"⚠️ 从 {source['name']} 获取稳定币数据失败 (尝试 {attempt+1}/3): {e}")
-                time.sleep(2)
-                continue
-        print(f"❌ 从 {source['name']} 获取数据全部失败，尝试下一个数据源")
-    return {"usdt": 0, "usdc": 0}
-
-# ==================== v2.2.2 增强容错：交易所余额（多重备份 + 重试） ====================
-def get_brk_exchange_balance():
-    """获取交易所BTC余额，增加重试和多数据源备份"""
-    cache_key = "brk_balance"
-    now = time.time()
-    if cache_key in data_cache and (now - data_cache[cache_key]["timestamp"]) < CACHE_TTL:
-        return data_cache[cache_key]["data"]
-
-    # 数据源列表（按优先级排序）
-    sources = [
-        {"name": "BRK", "url": "https://api.bitview.space/v1/exchange/balance"},
-        {"name": "CoinPaprika", "url": "https://api.coinpaprika.com/v1/global"},
-    ]
-
-    for source in sources:
-        for attempt in range(3):
-            try:
-                resp = requests.get(source["url"], timeout=10)
-                data = resp.json()
-                if not data:
-                    continue
-
-                if source["name"] == "BRK":
-                    if "balance" in data:
-                        if len(data.get("history", [])) >= 2:
-                            curr = data["history"][-1]
-                            prev = data["history"][-2]
-                            change = (curr - prev) / prev * 100
-                            result = {"balance": data["balance"], "change": change}
-                        else:
-                            result = {"balance": data["balance"], "change": 0}
-                        data_cache[cache_key] = {"data": result, "timestamp": now}
-                        print(f"✅ 交易所余额数据获取成功，来源: {source['name']}")
-                        return result
-            except Exception as e:
-                print(f"⚠️ 从 {source['name']} 获取交易所余额失败 (尝试 {attempt+1}/3): {e}")
-                time.sleep(2)
-                continue
-        print(f"❌ 从 {source['name']} 获取数据全部失败，尝试下一个数据源")
-    return {"balance": 0, "change": 0}
-
-# ==================== 其他数据源 ====================
-def get_coinbase_premium():
-    cache_key = "coinbase_premium"
-    now = time.time()
-    if cache_key in data_cache and (now - data_cache[cache_key]["timestamp"]) < CACHE_TTL:
-        return data_cache[cache_key]["data"]
-    try:
-        cb_url = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
-        cb_resp = requests.get(cb_url, timeout=5)
-        cb_data = cb_resp.json()
-        if "data" not in cb_data:
-            return 0.0
-        cb_price = float(cb_data["data"]["amount"])
-        okx_url = "https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT"
-        okx_resp = requests.get(okx_url, timeout=5)
-        okx_data = okx_resp.json()
-        if okx_data.get("code") != "0":
-            return 0.0
-        okx_price = float(okx_data["data"][0]["last"])
-        premium = (cb_price - okx_price) / okx_price * 100
-        data_cache[cache_key] = {"data": premium, "timestamp": now}
-        return premium
-    except Exception as e:
-        print(f"获取Coinbase溢价失败: {e}")
-        return 0.0
-
-def get_funding_trend_score(symbol):
-    history = funding_history.get(symbol, [])
-    if len(history) < 6:
-        return 0
-    recent = list(history)[-6:]
-    diffs = [recent[i] - recent[i-1] for i in range(1, len(recent))]
-    avg_change = sum(diffs) / len(diffs) if diffs else 0
-    if avg_change > 0.0001:
-        return -1
-    elif avg_change < -0.0001:
-        return 1
-    else:
-        return 0
-
-# ==================== v2.2.1 大单净流向真实实现 ====================
-def get_whale_net_flow(symbol, btc_price=None):
-    global whale_trades_cache
-    now = time.time()
-    
-    if symbol in whale_trades_cache:
-        data = whale_trades_cache[symbol]
-        if now - data["timestamp"] < WHALE_TRACK_WINDOW:
-            return data["net_flow"]
-    
-    try:
-        if btc_price is None:
-            btc_price = price_data.get(BTC_SYMBOL, {}).get("price", 0)
-        if btc_price == 0:
-            return 0
-        
-        symbol_price = price_data.get(symbol, {}).get("price", 0)
-        if symbol_price == 0:
-            return 0
-        threshold_quote = 5 * btc_price
-        min_size = threshold_quote / symbol_price
-        
-        inst_id = symbol.replace("-USDT", "-USDT-SWAP")
-        url = f"https://www.okx.com/api/v5/market/trades?instId={inst_id}&limit=100"
-        resp = requests.get(url, timeout=5)
-        data = resp.json()
-        if data.get("code") != "0":
-            return 0
-        
-        net_flow = 0
-        cutoff_time = int((now - WHALE_TRACK_WINDOW) * 1000)
-        
-        for trade in data.get("data", []):
-            ts = int(trade.get("ts", 0))
-            if ts < cutoff_time:
-                continue
-            size = float(trade.get("sz", 0))
-            side = trade.get("side", "")
-            if size >= min_size:
-                if side == "buy":
-                    net_flow += size
-                elif side == "sell":
-                    net_flow -= size
-        
-        net_flow_btc = net_flow * symbol_price / btc_price
-        whale_trades_cache[symbol] = {"net_flow": net_flow_btc, "timestamp": now}
-        return net_flow_btc
-        
-    except Exception as e:
-        print(f"获取大单净流向失败 {symbol}: {e}")
-        return 0
-
-# ==================== v2.2.1 多空比变化真实实现 ====================
-def get_lsr_change():
-    api_key = os.environ.get("OKX_API_KEY")
-    secret_key = os.environ.get("OKX_SECRET_KEY")
-    passphrase = os.environ.get("OKX_PASSPHRASE")
-    
-    if not api_key or not secret_key:
-        return 0.0
-    
-    try:
-        dt = datetime.now(timezone.utc)
-        timestamp = dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
-        method = "GET"
-        request_path = "/api/v5/account/positions?instType=SWAP"
-        url = "https://www.okx.com" + request_path
-        sign = generate_sign(timestamp, method, request_path, "", secret_key)
-        headers = {
-            "OK-ACCESS-KEY": api_key,
-            "OK-ACCESS-SIGN": sign,
-            "OK-ACCESS-TIMESTAMP": timestamp,
-            "OK-ACCESS-PASSPHRASE": passphrase,
-            "Content-Type": "application/json",
-        }
-        resp = requests.get(url, headers=headers, timeout=5)
-        data = resp.json()
-        
-        if data.get("code") != "0":
-            return 0.0
-        
-        long_pos = 0
-        short_pos = 0
-        for pos in data.get("data", []):
-            if pos.get("instId") != "BTC-USDT-SWAP":
-                continue
-            pos_side = pos.get("posSide", "")
-            notional = float(pos.get("notionalUsd", 0))
-            if pos_side == "long":
-                long_pos += notional
-            elif pos_side == "short":
-                short_pos += notional
-        
-        if short_pos == 0:
-            return 0.0
-        
-        current_lsr = long_pos / short_pos
-        cache_key = "lsr_history"
-        now = time.time()
-        if cache_key in data_cache and "lsr" in data_cache[cache_key]:
-            prev_lsr = data_cache[cache_key]["lsr"]
-            prev_time = data_cache[cache_key]["timestamp"]
-            if now - prev_time < 7200:
-                change_pct = (current_lsr - prev_lsr) / prev_lsr * 100
-                data_cache[cache_key] = {"lsr": current_lsr, "timestamp": now}
-                return change_pct
-        
-        data_cache[cache_key] = {"lsr": current_lsr, "timestamp": now}
-        return 0.0
-        
-    except Exception as e:
-        print(f"获取多空比变化失败: {e}")
-        return 0.0
-
-# ==================== v2.2.0 动量突破函数 ====================
-def update_momentum_cache(symbol, current_price, volume):
-    now = datetime.now(timezone.utc)
-    if symbol not in momentum_cache:
-        momentum_cache[symbol] = {"prices": [], "volumes": [], "time": now}
-    cache = momentum_cache[symbol]
-    cache["prices"].append((now, current_price))
-    cache["volumes"].append((now, volume))
-    cutoff = now - timedelta(minutes=15)
-    cache["prices"] = [(t, p) for t, p in cache["prices"] if t > cutoff]
-    cutoff_vol = now - timedelta(hours=1)
-    cache["volumes"] = [(t, v) for t, v in cache["volumes"] if t > cutoff_vol]
-    cache["time"] = now
-
-def get_15min_momentum(symbol):
-    cache = momentum_cache.get(symbol)
-    if not cache or len(cache["prices"]) < 2:
-        return 0.0
-    prices = cache["prices"]
-    oldest_price = prices[0][1]
-    latest_price = prices[-1][1]
-    if oldest_price == 0:
-        return 0.0
-    return (latest_price - oldest_price) / oldest_price * 100
-
-def get_volume_spike(symbol):
-    cache = momentum_cache.get(symbol)
-    if not cache or len(cache["volumes"]) < 2:
-        return 1.0
-    recent_vol = sum(v for _, v in cache["volumes"])
-    if symbol in price_data:
-        daily_avg = price_data[symbol].get("volume", 0) / 24
-        if daily_avg > 0:
-            return recent_vol / daily_avg
-    return 1.0
-
-def get_new_high(symbol, current_price, lookback=20):
-    try:
-        url = f"https://www.okx.com/api/v5/market/history-candles?instId={symbol}&bar=4H&limit={lookback+5}"
-        resp = requests.get(url, timeout=5)
-        data = resp.json()
-        if data["code"] != "0" or len(data["data"]) < lookback:
-            return "NEUTRAL", 0
-        candles = data["data"]
-        highs = [float(c[2]) for c in candles[-lookback:]]
-        lows = [float(c[3]) for c in candles[-lookback:]]
-        high = max(highs)
-        low = min(lows)
-        if current_price > high:
-            return "NEW_HIGH", (current_price - high) / high * 100
-        elif current_price < low:
-            return "NEW_LOW", (low - current_price) / low * 100
-        else:
-            return "NEUTRAL", 0
-    except Exception as e:
-        print(f"获取新高/新低失败 {symbol}: {e}")
-        return "NEUTRAL", 0
-
-# ==================== 基础工具函数 ====================
+# ==================== 核心工具函数 ====================
 def get_swap_symbols():
     try:
         url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
@@ -642,292 +285,6 @@ def get_open_interest(symbol):
     except:
         return 0.0
 
-oi_cache = {}
-
-def get_oi_change(symbol):
-    try:
-        current_oi = get_open_interest(symbol)
-        if current_oi == 0:
-            return 0.0, False
-        now = time.time()
-        if symbol in oi_cache:
-            prev_time, prev_oi = oi_cache[symbol]
-            if now - prev_time < 86400:
-                change_pct = (current_oi - prev_oi) / prev_oi * 100
-                significant = abs(change_pct) >= OI_CHANGE_THRESHOLD
-                return change_pct, significant
-        oi_cache[symbol] = (now, current_oi)
-        return 0.0, False
-    except:
-        return 0.0, False
-
-def get_market_sentiment():
-    try:
-        main_coins = ["BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT"]
-        changes = []
-        volumes = []
-        for sym in main_coins:
-            url = f"https://www.okx.com/api/v5/market/ticker?instId={sym}"
-            resp = requests.get(url, timeout=3)
-            data = resp.json()
-            if data["code"] == "0" and data["data"]:
-                changes.append(float(data["data"][0]["priceChangePercent"]))
-                volumes.append(float(data["data"][0]["volCcy24h"]))
-        if not changes:
-            return 50
-        avg_change = sum(changes) / len(changes)
-        avg_volume = sum(volumes) / len(volumes) if volumes else 1
-        change_score = 50 + avg_change * 10
-        change_score = max(0, min(100, change_score))
-        volume_score = 50 + (avg_volume / 5e8) * 20
-        volume_score = max(0, min(100, volume_score))
-        sentiment = int(change_score * 0.7 + volume_score * 0.3)
-        return max(0, min(100, sentiment))
-    except:
-        return 50
-
-def get_sector_strength(symbol):
-    sector_map = {
-        "ETH": "Layer1", "SOL": "Layer1", "ADA": "Layer1", "AVAX": "Layer1",
-        "UNI": "DeFi", "AAVE": "DeFi", "MKR": "DeFi", "COMP": "DeFi",
-        "ARB": "Layer2", "OP": "Layer2", "MATIC": "Layer2",
-        "DOGE": "Meme", "SHIB": "Meme", "PEPE": "Meme",
-        "LINK": "Oracle", "BAND": "Oracle",
-    }
-    base = symbol.split("-")[0]
-    sector = sector_map.get(base, None)
-    if not sector:
-        return 0
-    sector_coins = [s for s in alt_symbols if s.split("-")[0] in sector_map and sector_map[s.split("-")[0]] == sector]
-    if not sector_coins:
-        return 0
-    changes = []
-    for s in sector_coins:
-        if s in price_data and price_data[s]["change"] != 0:
-            changes.append(price_data[s]["change"])
-    if not changes:
-        return 0
-    return sum(changes) / len(changes)
-
-def get_mtf_alignment(symbol, current_price):
-    try:
-        intervals = ["1h", "4h", "24h"]
-        directions = []
-        for interval in intervals:
-            url = f"https://www.okx.com/api/v5/market/history-candles?instId={symbol}&bar={interval}&limit=2"
-            resp = requests.get(url, timeout=3)
-            data = resp.json()
-            if data["code"] != "0" or len(data["data"]) < 2:
-                continue
-            candles = data["data"]
-            open_price = float(candles[1][1])
-            close_price = float(candles[0][4])
-            change = (close_price - open_price) / open_price * 100
-            btc_url = f"https://www.okx.com/api/v5/market/history-candles?instId=BTC-USDT&bar={interval}&limit=2"
-            btc_resp = requests.get(btc_url, timeout=3)
-            btc_data = btc_resp.json()
-            if btc_data["code"] != "0" or len(btc_data["data"]) < 2:
-                continue
-            btc_candles = btc_data["data"]
-            btc_open = float(btc_candles[1][1])
-            btc_close = float(btc_candles[0][4])
-            btc_change = (btc_close - btc_open) / btc_open * 100
-            diff = change - btc_change
-            if diff > 0.3:
-                directions.append("LONG")
-            elif diff < -0.3:
-                directions.append("SHORT")
-            else:
-                directions.append("NEUTRAL")
-        long_count = directions.count("LONG")
-        short_count = directions.count("SHORT")
-        if long_count >= 2 and short_count == 0:
-            return "LONG", 20
-        elif short_count >= 2 and long_count == 0:
-            return "SHORT", 20
-        elif long_count == 1 and short_count == 0:
-            return "LONG", 10
-        elif short_count == 1 and long_count == 0:
-            return "SHORT", 10
-        else:
-            return "NEUTRAL", 0
-    except:
-        return "NEUTRAL", 0
-
-def get_bid_ask_ratio(symbol):
-    try:
-        url = f"https://www.okx.com/api/v5/market/books?instId={symbol}&sz=10"
-        resp = requests.get(url, timeout=3)
-        data = resp.json()
-        if data["code"] != "0" or not data["data"]:
-            return 1.0
-        bids = data["data"][0]["bids"]
-        asks = data["data"][0]["asks"]
-        bid_volume = sum(float(b[1]) for b in bids)
-        ask_volume = sum(float(a[1]) for a in asks)
-        if ask_volume == 0:
-            return 2.0
-        return bid_volume / ask_volume
-    except:
-        return 1.0
-
-def get_atr_ratio(symbol, period=20):
-    try:
-        url = f"https://www.okx.com/api/v5/market/history-candles?instId={symbol}&bar=1h&limit={period+10}"
-        resp = requests.get(url, timeout=5)
-        data = resp.json()
-        if data["code"] != "0":
-            return 1.0
-        candles = data["data"]
-        if len(candles) < period:
-            return 1.0
-        tr_list = []
-        for i in range(1, len(candles)):
-            high = float(candles[i][2])
-            low = float(candles[i][3])
-            prev_close = float(candles[i-1][4])
-            tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-            tr_list.append(tr)
-        current_atr = sum(tr_list[-14:]) / 14 if len(tr_list) >= 14 else sum(tr_list) / len(tr_list)
-        avg_atr = sum(tr_list[-period:]) / period
-        if avg_atr == 0:
-            return 1.0
-        return current_atr / avg_atr
-    except:
-        return 1.0
-
-def get_price_position(symbol, current_price, period=20):
-    try:
-        url = f"https://www.okx.com/api/v5/market/history-candles?instId={symbol}&bar=4H&limit={period+5}"
-        resp = requests.get(url, timeout=5)
-        data = resp.json()
-        if data["code"] != "0":
-            return 0.5
-        candles = data["data"]
-        if len(candles) < period:
-            return 0.5
-        highs = [float(c[2]) for c in candles[-period:]]
-        lows = [float(c[3]) for c in candles[-period:]]
-        high = max(highs)
-        low = min(lows)
-        if high == low:
-            return 0.5
-        return (current_price - low) / (high - low)
-    except:
-        return 0.5
-
-def get_premium(symbol):
-    try:
-        spot_symbol = symbol
-        swap_symbol = symbol.replace("-USDT", "-USDT-SWAP")
-        url = f"https://www.okx.com/api/v5/market/ticker?instId={spot_symbol}"
-        resp = requests.get(url, timeout=3)
-        spot_data = resp.json()
-        if spot_data["code"] != "0":
-            return 0.0
-        spot_price = float(spot_data["data"][0]["last"])
-        url = f"https://www.okx.com/api/v5/market/ticker?instId={swap_symbol}"
-        resp = requests.get(url, timeout=3)
-        swap_data = resp.json()
-        if swap_data["code"] != "0":
-            return 0.0
-        swap_price = float(swap_data["data"][0]["last"])
-        if spot_price == 0:
-            return 0.0
-        return (swap_price - spot_price) / spot_price * 100
-    except:
-        return 0.0
-
-def get_dynamic_zscore_threshold(symbol, direction):
-    atr_ratio = get_atr_ratio(symbol)
-    if direction == "LONG":
-        base = ZSCORE_BASE_LONG
-    else:
-        base = abs(ZSCORE_BASE_SHORT)
-    dynamic = base * (1 + (atr_ratio - 1) * ATR_ADJUST_FACTOR)
-    if direction == "LONG":
-        return min(max(dynamic, ZSCORE_MIN), ZSCORE_MAX)
-    else:
-        return -min(max(dynamic, ZSCORE_MIN), ZSCORE_MAX)
-
-def get_orderbook_imbalance(symbol):
-    try:
-        url = f"https://www.okx.com/api/v5/market/books?instId={symbol}&sz=10"
-        resp = requests.get(url, timeout=3)
-        data = resp.json()
-        if data["code"] != "0" or not data["data"]:
-            return 0
-        bids = data["data"][0]["bids"]
-        asks = data["data"][0]["asks"]
-        bid_vol = sum(float(b[1]) for b in bids)
-        ask_vol = sum(float(a[1]) for a in asks)
-        total = bid_vol + ask_vol
-        if total == 0:
-            return 0
-        imbalance = (bid_vol - ask_vol) / total
-        return int(imbalance * 15)
-    except:
-        return 0
-
-def update_signal_history(score, success):
-    global SIGNAL_HISTORY
-    with STATS_LOCK:
-        SIGNAL_HISTORY.append({"score": score, "success": success})
-        if len(SIGNAL_HISTORY) > 50:
-            SIGNAL_HISTORY.pop(0)
-
-def get_whale_score(symbol):
-    try:
-        url = f"https://www.okx.com/api/v5/market/history-candles?instId={symbol}&bar=1m&limit=20"
-        resp = requests.get(url, timeout=3)
-        data = resp.json()
-        if data["code"] != "0":
-            return 0
-        candles = data["data"]
-        if len(candles) < 16:
-            return 0
-        recent_vol = sum(float(c[5]) for c in candles[-5:])
-        avg_vol = sum(float(c[5]) for c in candles[-16:-6]) / 10
-        if avg_vol == 0:
-            return 0
-        ratio = recent_vol / avg_vol
-        if ratio > WHALE_VOLUME_THRESHOLD:
-            return min(15, int(ratio * 5))
-        return 0
-    except:
-        return 0
-
-def update_candle_cache(symbol, close_price, volume):
-    now = datetime.now(timezone.utc)
-    if symbol not in price_candle_cache:
-        price_candle_cache[symbol] = []
-    price_candle_cache[symbol].append((now, close_price, volume))
-    if len(price_candle_cache[symbol]) > 20:
-        price_candle_cache[symbol].pop(0)
-    update_momentum_cache(symbol, close_price, volume)
-
-def get_liquidity_trap_score(symbol, current_price):
-    try:
-        ema50 = get_ema(symbol)
-        if ema50 == 0:
-            return 0, ""
-        if symbol not in price_candle_cache or len(price_candle_cache[symbol]) < 2:
-            return 0, ""
-        recent = price_candle_cache[symbol]
-        lows = [p[1] for p in recent[-5:] if p[1] > 0]
-        highs = [p[1] for p in recent[-5:] if p[1] > 0]
-        if not lows or not highs:
-            return 0, ""
-        min_low = min(lows)
-        max_high = max(highs)
-        if min_low < ema50 * (1 - PRICE_TRAP_THRESHOLD) and current_price > ema50:
-            return 20, "假跌破反转 +20"
-        if max_high > ema50 * (1 + PRICE_TRAP_THRESHOLD) and current_price < ema50:
-            return 20, "假突破反转 +20"
-        return 0, ""
-    except:
-        return 0, ""
-
 def calculate_position(current_price, atr_pct, score, account_balance=None, leverage=None):
     if account_balance is None:
         account_balance = get_usdt_balance()
@@ -935,7 +292,7 @@ def calculate_position(current_price, atr_pct, score, account_balance=None, leve
         leverage = current_leverage
     if atr_pct <= 0:
         atr_pct = 0.5
-    stop_loss_pct = atr_pct * 1.5
+    stop_loss_pct = atr_pct * ATR_STOP_MULTIPLIER
     risk_amount = account_balance * RISK_PER_TRADE
     adjusted_risk = risk_amount * (0.5 + (score / 100) * 0.5)
     contract_size = (adjusted_risk * leverage) / (current_price * (stop_loss_pct / 100))
@@ -944,96 +301,28 @@ def calculate_position(current_price, atr_pct, score, account_balance=None, leve
 def get_session_score():
     hour = datetime.now(timezone.utc).hour
     if 12 <= hour <= 18:
-        return 10
-    elif 22 <= hour or hour <= 2:
         return 5
+    elif 22 <= hour or hour <= 2:
+        return 3
     elif 6 <= hour <= 10:
-        return -10
+        return -5
     return 0
 
-def get_rsi_entry_advice(symbol, signal_type):
-    rsi = calculate_rsi(symbol, interval="1h")
-    if signal_type == "LONG":
-        if rsi < 50:
-            return "建议现价入场"
-        elif rsi < 65:
-            return "建议回调至EMA10附近挂单"
-        else:
-            return "RSI超买，建议等待回调再入场"
-    else:
-        if rsi > 50:
-            return "建议现价入场"
-        elif rsi > 35:
-            return "建议反弹至EMA10附近挂单"
-        else:
-            return "RSI超卖，建议等待反弹再入场"
-
-def update_diff_history(symbol, current_diff, max_len=100):
-    if symbol not in diff_history:
-        diff_history[symbol] = []
-    history = diff_history[symbol]
-    history.append(current_diff)
-    if len(history) > max_len:
-        history.pop(0)
-
-def get_zscore(symbol, current_diff):
-    history = diff_history.get(symbol, [])
-    if len(history) < MIN_ZSCORE_SAMPLES:
-        return None
-    mean = sum(history) / len(history)
-    variance = sum((x - mean) ** 2 for x in history) / len(history)
-    std = variance ** 0.5
-    if std == 0:
-        return 0
-    return (current_diff - mean) / std
-
-def get_ema_values(symbol, periods=[20, 50, 100]):
-    emas = {}
-    for p in periods:
-        emas[p] = get_ema(symbol, p)
-    return emas
-
-def get_macd(symbol, fast=12, slow=26, signal=9):
-    try:
-        url = f"https://www.okx.com/api/v5/market/history-candles?instId={symbol}&bar=4H&limit=100"
-        resp = requests.get(url, timeout=5)
-        data = resp.json()
-        if data["code"] != "0":
-            return 0.0
-        candles = data["data"]
-        closes = [float(c[4]) for c in candles]
-        if len(closes) < 50:
-            return 0.0
-        def ema(arr, period):
-            if len(arr) < period:
-                return 0
-            alpha = 2 / (period + 1)
-            ema_val = arr[0]
-            for x in arr[1:]:
-                ema_val = x * alpha + ema_val * (1 - alpha)
-            return ema_val
-        fast_ema = ema(closes, fast)
-        slow_ema = ema(closes, slow)
-        macd_line = fast_ema - slow_ema
-        return macd_line
-    except:
-        return 0.0
-
-def get_trend_state(symbol, current_price):
-    if not ENABLE_TREND_FILTER:
-        return "NEUTRAL"
-    emas = get_ema_values(symbol)
-    ema20 = emas.get(20, 0)
-    ema50 = emas.get(50, 0)
-    ema100 = emas.get(100, 0)
+# ==================== 趋势判定 ====================
+def get_coin_trend(symbol, current_price):
+    ema20 = get_ema(symbol, 20)
+    ema50 = get_ema(symbol, 50)
+    ema100 = get_ema(symbol, 100)
     if ema20 == 0 or ema50 == 0 or ema100 == 0:
-        return "NEUTRAL"
+        return "NEUTRAL", 0
+    # 多头排列
     if ema20 > ema50 > ema100:
         ema_state = "UP"
     elif ema20 < ema50 < ema100:
         ema_state = "DOWN"
     else:
         ema_state = "NEUTRAL"
+    # 价格相对EMA50的位置
     price_vs_ema50 = current_price / ema50
     if price_vs_ema50 > 1.02:
         price_state = "UP"
@@ -1041,248 +330,115 @@ def get_trend_state(symbol, current_price):
         price_state = "DOWN"
     else:
         price_state = "NEUTRAL"
-    macd_val = get_macd(symbol)
-    if macd_val > 0:
-        macd_state = "UP"
-    elif macd_val < 0:
-        macd_state = "DOWN"
-    else:
-        macd_state = "NEUTRAL"
+    # 综合判定
     if ema_state == "UP" and (price_state == "UP" or price_state == "NEUTRAL"):
-        return "UP"
+        return "UP", WEIGHT_TREND
     elif ema_state == "DOWN" and (price_state == "DOWN" or price_state == "NEUTRAL"):
-        return "DOWN"
+        return "DOWN", WEIGHT_TREND
     else:
-        if macd_state != "NEUTRAL":
-            return macd_state
-        if price_state != "NEUTRAL":
-            return price_state
-        return "NEUTRAL"
+        if price_state == "UP":
+            return "UP", WEIGHT_TREND // 2
+        elif price_state == "DOWN":
+            return "DOWN", WEIGHT_TREND // 2
+        else:
+            return "NEUTRAL", 0
 
-def get_bias_percent(symbol, current_price, period=50):
-    ema = get_ema(symbol, period)
-    if ema == 0:
-        return 0.0
-    return (current_price - ema) / ema * 100
+# ==================== 背离差计算 ====================
+def get_divergence_score(alt_change, btc_change):
+    diff = alt_change - btc_change
+    # 将背离差映射到 0~WEIGHT_DIVERGENCE 分
+    score = min(WEIGHT_DIVERGENCE, max(0, abs(diff) * 8))
+    return score, diff
 
-def get_volume_confirmation(symbol):
-    try:
-        url = f"https://www.okx.com/api/v5/market/history-candles?instId={symbol}&bar=1m&limit=20"
-        resp = requests.get(url, timeout=3)
-        data = resp.json()
-        if data["code"] != "0" or len(data["data"]) < 16:
-            return False
-        candles = data["data"]
-        recent_vol = sum(float(c[5]) for c in candles[-5:])
-        avg_vol = sum(float(c[5]) for c in candles[-16:-6]) / 10
-        if avg_vol == 0:
-            return False
-        return recent_vol > avg_vol * VOLUME_CONFIRM_RATIO
-    except:
-        return False
+# ==================== 评分引擎（5个核心因子） ====================
+def analyze_signal(symbol, current_price, volume, alt_change, btc_change):
+    # ---- 1. 趋势判定 ----
+    trend_dir, trend_score = get_coin_trend(symbol, current_price)
+    if trend_dir == "NEUTRAL":
+        return None, 0, "趋势不明朗"
+
+    # ---- 2. 背离差 ----
+    div_score, diff = get_divergence_score(alt_change, btc_change)
+    if div_score < 5:
+        return None, 0, "背离差不足"
+
+    # 确定信号方向：趋势方向 + 背离方向一致
+    if (trend_dir == "UP" and diff > 0) or (trend_dir == "DOWN" and diff < 0):
+        signal_type = "LONG" if trend_dir == "UP" else "SHORT"
+        direction_bonus = 10
+    else:
+        # 趋势与背离方向不一致，仍可能产生信号但扣分
+        signal_type = "LONG" if diff > 0 else "SHORT"
+        direction_bonus = -10
+
+    # ---- 3. 成交量 ----
+    vol_score = WEIGHT_VOLUME if volume > VOLUME_THRESHOLD else 0
+
+    # ---- 4. RSI ----
+    rsi = calculate_rsi(symbol)
+    if signal_type == "LONG" and rsi < RSI_OVERSOLD:
+        rsi_score = WEIGHT_RSI
+    elif signal_type == "SHORT" and rsi > RSI_OVERBOUGHT:
+        rsi_score = WEIGHT_RSI
+    elif signal_type == "LONG" and rsi > RSI_OVERBOUGHT:
+        rsi_score = -WEIGHT_RSI // 2
+    elif signal_type == "SHORT" and rsi < RSI_OVERSOLD:
+        rsi_score = -WEIGHT_RSI // 2
+    else:
+        rsi_score = 0
+
+    # ---- 5. 资金费率 ----
+    funding = get_funding_rate(symbol)
+    if signal_type == "LONG":
+        if funding < -0.005:
+            funding_score = WEIGHT_FUNDING
+        elif funding > 0.01:
+            funding_score = -WEIGHT_FUNDING
+        else:
+            funding_score = 0
+    else:  # SHORT
+        if funding > 0.005:
+            funding_score = WEIGHT_FUNDING
+        elif funding < -0.01:
+            funding_score = -WEIGHT_FUNDING
+        else:
+            funding_score = 0
+
+    # ---- 综合评分 ----
+    base_score = trend_score + div_score + vol_score + rsi_score + funding_score + direction_bonus
+    # 加上时段分（微调）
+    session_score = get_session_score()
+    total_score = max(0, min(100, base_score + session_score))
+
+    # 构造详情
+    details = [
+        f"趋势: {trend_dir} ({trend_score}分)",
+        f"背离差: {diff:+.2f}% ({div_score:.0f}分)",
+        f"成交量: {'达标' if vol_score>0 else '一般'} ({vol_score}分)",
+        f"RSI: {rsi:.0f} ({rsi_score:+d}分)",
+        f"费率: {funding*100:.3f}% ({funding_score:+d}分)"
+    ]
+    if direction_bonus != 0:
+        details.append(f"方向一致性: {direction_bonus:+d}分")
+    details = " | ".join(details)
+
+    return signal_type, total_score, details
+
+# ==================== 信号冷却检查 ====================
+def check_cooldown(symbol, signal_type):
+    now = time.time()
+    if symbol in last_alert_time:
+        last = last_alert_time[symbol]
+        if last["direction"] == signal_type and (now - last["timestamp"]) < COOLDOWN_HOURS * 3600:
+            return True
+    return False
+
+def update_cooldown(symbol, signal_type):
+    last_alert_time[symbol] = {"timestamp": time.time(), "direction": signal_type}
 
 # ---- Part 1 结束，请继续复制 Part 2 ----
-# ==================== 核心评分（v2.2.2 集成所有因子） ====================
-def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, use_independent=False):
-    if use_independent:
-        if alt_change > 0:
-            signal_type = "LONG"
-        elif alt_change < 0:
-            signal_type = "SHORT"
-        else:
-            return None, 0, ""
-    else:
-        if abs(btc_change) < BTC_TREND_THRESHOLD:
-            return None, 0, ""
-        zscore = get_zscore(symbol, diff)
-        if zscore is None:
-            if btc_change > 0 and diff > FALLBACK_LONG:
-                signal_type = "LONG"
-            elif btc_change < 0 and diff < FALLBACK_SHORT:
-                signal_type = "SHORT"
-            else:
-                return None, 0, ""
-        else:
-            long_threshold = get_dynamic_zscore_threshold(symbol, "LONG")
-            short_threshold = get_dynamic_zscore_threshold(symbol, "SHORT")
-            if zscore > long_threshold:
-                signal_type = "LONG"
-            elif zscore < short_threshold:
-                signal_type = "SHORT"
-            else:
-                return None, 0, ""
 
-    # 趋势判定
-    trend_state = get_trend_state(symbol, current_price)
-    trend_text = {"UP": "上升趋势", "DOWN": "下降趋势", "NEUTRAL": "横盘震荡"}[trend_state]
-
-    is_against_trend = False
-    if ENABLE_TREND_FILTER:
-        if signal_type == "LONG" and trend_state == "DOWN":
-            is_against_trend = True
-        elif signal_type == "SHORT" and trend_state == "UP":
-            is_against_trend = True
-
-    if is_against_trend:
-        return None, 0, f"逆势屏蔽: 信号方向与趋势相反 (趋势:{trend_text})"
-
-    score = SCORE_BASE
-    details = []
-
-    # 1. 趋势加分
-    trend_bonus = 0
-    if signal_type == "LONG" and trend_state == "UP":
-        trend_bonus = SCORE_TREND_BONUS
-    elif signal_type == "SHORT" and trend_state == "DOWN":
-        trend_bonus = SCORE_TREND_BONUS
-    elif trend_state == "NEUTRAL":
-        trend_bonus = SCORE_NEUTRAL_PENALTY
-    if trend_bonus != 0:
-        score += trend_bonus
-        details.append(f"趋势 {trend_text} {trend_bonus:+d}")
-
-    # 2. 动量突破
-    if ENABLE_MOMENTUM_BREAKOUT:
-        momentum_15m = get_15min_momentum(symbol)
-        volume_spike = get_volume_spike(symbol)
-        if signal_type == "LONG" and momentum_15m > MOMENTUM_15MIN_THRESHOLD:
-            score += SCORE_MOMENTUM
-            details.append(f"动量突破 {momentum_15m:+.2f}% (+{SCORE_MOMENTUM})")
-        elif signal_type == "SHORT" and momentum_15m < -MOMENTUM_15MIN_THRESHOLD:
-            score += SCORE_MOMENTUM
-            details.append(f"动量突破 {momentum_15m:+.2f}% (+{SCORE_MOMENTUM})")
-
-        if volume_spike > MOMENTUM_VOLUME_RATIO:
-            score += SCORE_VOLUME_SPIKE
-            details.append(f"成交量暴增 {volume_spike:.1f}x (+{SCORE_VOLUME_SPIKE})")
-        else:
-            details.append(f"成交量 {volume_spike:.1f}x")
-
-        high_state, high_pct = get_new_high(symbol, current_price)
-        if high_state == "NEW_HIGH" and signal_type == "LONG":
-            score += SCORE_NEW_HIGH
-            details.append(f"突破20日新高 +{SCORE_NEW_HIGH}")
-        elif high_state == "NEW_LOW" and signal_type == "SHORT":
-            score += SCORE_NEW_HIGH
-            details.append(f"跌破20日新低 +{SCORE_NEW_HIGH}")
-        elif high_state == "NEW_HIGH" and signal_type == "SHORT":
-            score -= SCORE_NEW_HIGH // 2
-            details.append(f"价格新高但做空 -{SCORE_NEW_HIGH//2}")
-        elif high_state == "NEW_LOW" and signal_type == "LONG":
-            score -= SCORE_NEW_HIGH // 2
-            details.append(f"价格新低但做多 -{SCORE_NEW_HIGH//2}")
-        else:
-            details.append("无新高/新低")
-
-    # 3. 大单净流向
-    btc_price = price_data[BTC_SYMBOL]["price"]
-    whale_net = get_whale_net_flow(symbol, btc_price)
-    if ENABLE_WHALE_TRACKING and whale_net != 0:
-        if (signal_type == "LONG" and whale_net > 0) or (signal_type == "SHORT" and whale_net < 0):
-            score += SCORE_WHALE
-            details.append(f"大单净流向 {whale_net:+.2f} BTC (+{SCORE_WHALE})")
-        else:
-            score -= SCORE_WHALE // 2
-            details.append(f"大单净流向 {whale_net:+.2f} BTC (-{SCORE_WHALE//2})")
-    else:
-        details.append("大单净流向: 无大单")
-
-    # 4. 多空比变化
-    lsr_change = get_lsr_change()
-    if ENABLE_LSR_CHANGE and lsr_change != 0:
-        if (signal_type == "LONG" and lsr_change < 0) or (signal_type == "SHORT" and lsr_change > 0):
-            score += SCORE_LSR
-            details.append(f"多空比变化 {lsr_change:+.1f}% (+{SCORE_LSR})")
-        else:
-            score -= SCORE_LSR // 2
-            details.append(f"多空比变化 {lsr_change:+.1f}% (-{SCORE_LSR//2})")
-    else:
-        details.append("多空比变化: 等待数据")
-
-    # 5. 稳定币市值
-    stablecoin = get_stablecoin_data()
-    if ENABLE_STABLECOIN_MONITOR and stablecoin["usdt"] > 0:
-        if stablecoin["usdt"] > 1000 and signal_type == "LONG":
-            score += SCORE_STABLECOIN
-            details.append(f"USDT市值 {stablecoin['usdt']:.0f}亿 (+{SCORE_STABLECOIN})")
-        elif stablecoin["usdt"] < 900 and signal_type == "SHORT":
-            score += SCORE_STABLECOIN
-            details.append(f"USDT市值 {stablecoin['usdt']:.0f}亿 (+{SCORE_STABLECOIN})")
-        else:
-            details.append(f"USDT市值 {stablecoin['usdt']:.0f}亿")
-
-    # 6. Coinbase 溢价
-    premium = get_coinbase_premium()
-    if ENABLE_COINBASE_PREMIUM and premium != 0:
-        if (signal_type == "LONG" and premium > 0.1) or (signal_type == "SHORT" and premium < -0.1):
-            score += SCORE_COINBASE
-            details.append(f"Coinbase溢价 {premium:+.2f}% (+{SCORE_COINBASE})")
-        else:
-            score -= SCORE_COINBASE // 2
-            details.append(f"Coinbase溢价 {premium:+.2f}% (-{SCORE_COINBASE//2})")
-
-    # 7. 交易所余额变化
-    brk_data = get_brk_exchange_balance()
-    if ENABLE_EXCHANGE_BALANCE and brk_data["change"] != 0:
-        if (signal_type == "LONG" and brk_data["change"] < -0.5) or (signal_type == "SHORT" and brk_data["change"] > 0.5):
-            score += SCORE_BALANCE
-            details.append(f"交易所余额 {brk_data['change']:+.2f}% (+{SCORE_BALANCE})")
-        else:
-            score -= SCORE_BALANCE // 2
-            details.append(f"交易所余额 {brk_data['change']:+.2f}% (-{SCORE_BALANCE//2})")
-
-    # 8. 资金费率趋势（已修复）
-    funding_trend = get_funding_trend_score(symbol)
-    if funding_trend != 0:
-        if (signal_type == "LONG" and funding_trend == 1) or (signal_type == "SHORT" and funding_trend == -1):
-            score += SCORE_FUNDING_TREND
-            details.append(f"费率趋势看涨 (+{SCORE_FUNDING_TREND})")
-        else:
-            score -= SCORE_FUNDING_TREND // 2
-            details.append(f"费率趋势看跌 (-{SCORE_FUNDING_TREND//2})")
-
-    # 9. RSI 辅助
-    rsi = calculate_rsi(symbol)
-    if signal_type == "LONG" and rsi < 30:
-        score += 5
-        details.append(f"RSI={rsi:.0f} 超卖 (+5)")
-    elif signal_type == "SHORT" and rsi > 70:
-        score += 5
-        details.append(f"RSI={rsi:.0f} 超买 (+5)")
-
-    # 10. 成交量辅助
-    if volume > VOLUME_THRESHOLD:
-        score += 5
-        details.append(f"24h成交额 {volume/1e6:.1f}M (+5)")
-
-    # 11. 持仓量变化
-    oi_change, oi_sig = get_oi_change(symbol)
-    if oi_sig:
-        if (signal_type == "LONG" and oi_change > 0) or (signal_type == "SHORT" and oi_change < 0):
-            score += 10
-            details.append(f"持仓量变化 {oi_change:+.1f}% (+10)")
-
-    # 12. 盈亏比 & 仓位
-    atr_pct = get_atr_percent(symbol)
-    if signal_type == "LONG":
-        sl = current_price * (1 - atr_pct * 1.5 / 100)
-        tp = current_price * (1 + atr_pct * 2.5 / 100)
-        rr = (tp - current_price) / (current_price - sl) if (current_price - sl) > 0 else 0
-        details.append(f"止损 {sl:.4f} 止盈 {tp:.4f} 盈亏比 {rr:.1f}:1")
-    else:
-        sl = current_price * (1 + atr_pct * 1.5 / 100)
-        tp = current_price * (1 - atr_pct * 2.5 / 100)
-        rr = (current_price - tp) / (sl - current_price) if (sl - current_price) > 0 else 0
-        details.append(f"止损 {sl:.4f} 止盈 {tp:.4f} 盈亏比 {rr:.1f}:1")
-
-    balance = get_usdt_balance()
-    position_size = calculate_position(current_price, atr_pct, score, balance, current_leverage)
-    details.append(f"建议仓位：{position_size} 张 (杠杆{current_leverage}x，风险{RISK_PER_TRADE*100:.1f}%)")
-
-    final_score = max(0, min(100, score))
-    return signal_type, final_score, " | ".join(details)
-
-# ==================== 背离检测（已修复资金费率更新） ====================
+# ==================== 核心检测（独立触发，不依赖BTC波动） ====================
 def check_divergence():
     btc = price_data[BTC_SYMBOL]
     btc_change = btc["change"]
@@ -1298,64 +454,87 @@ def check_divergence():
             continue
         alt_change = alt["change"]
         alt_price = alt["price"]
-        diff = alt_change - btc_change
         volume = alt.get("volume", 0)
 
-        update_candle_cache(sym, alt_price, volume)
-        update_diff_history(sym, diff)
-
-        # 修复：更新资金费率历史
-        update_funding_history(sym)
-
-        if sym in last_alert_time and (now - last_alert_time[sym]) < ALERT_COOLDOWN:
+        # 独立触发：不再依赖 BTC 波动
+        signal_type, score, details = analyze_signal(sym, alt_price, volume, alt_change, btc_change)
+        if not signal_type:
             continue
 
-        if abs(btc_change) > BTC_TREND_THRESHOLD:
-            signal_type, score, details = analyze_signal(sym, diff, btc_change, alt_change, volume, alt_price, use_independent=False)
-        else:
+        # 冷却检查
+        if check_cooldown(sym, signal_type):
             continue
 
-        if signal_type and score >= MIN_SCORE_THRESHOLD:
-            last_alert_time[sym] = now
+        # 评分分级
+        if score >= SCORE_THRESHOLD_HIGH:
+            level = "高置信度"
             emoji = "🟢" if signal_type == "LONG" else "🔴"
-            action = "做多" if signal_type == "LONG" else "做空"
-            inst_id = sym
-            if inst_id in swap_symbols:
-                okx_url = f"https://www.okx.com/zh-hans/trade-swap/{inst_id.lower()}"
-            else:
-                okx_url = f"https://www.okx.com/zh-hans/markets/spot/{inst_id.lower()}"
-            trend_state = get_trend_state(sym, alt_price)
-            trend_emoji = {"UP": "🟢", "DOWN": "🔴", "NEUTRAL": "⚪"}[trend_state]
-            trend_label = {"UP": "上升趋势", "DOWN": "下降趋势", "NEUTRAL": "横盘震荡"}[trend_state]
-            alert_text = (
-                f"{emoji} 【{action}】[{sym}]({okx_url}) | 评分: {score:.2f}/100\n"
-                f"趋势: {trend_emoji} {trend_label}\n"
-                f"背离差: {diff:+.2f}% | 价格: ${alt_price:.4f}\n"
-                f"📊 {details}"
-            )
-            alerts.append({
-                "symbol": sym,
-                "signal_type": signal_type,
-                "price": alt_price,
-                "score": score,
-                "text": alert_text
-            })
+        elif score >= SCORE_THRESHOLD_MEDIUM:
+            level = "中等置信度"
+            emoji = "🟡" if signal_type == "LONG" else "🟠"
+        else:
+            continue  # 低置信度不推送
+
+        # 更新冷却
+        update_cooldown(sym, signal_type)
+
+        action = "做多" if signal_type == "LONG" else "做空"
+        inst_id = sym
+        okx_url = f"https://www.okx.com/zh-hans/trade-swap/{inst_id.lower()}" if inst_id in swap_symbols else f"https://www.okx.com/zh-hans/markets/spot/{inst_id.lower()}"
+
+        # 获取趋势方向（仅显示）
+        trend_dir, _ = get_coin_trend(sym, alt_price)
+        trend_emoji = {"UP": "🟢", "DOWN": "🔴", "NEUTRAL": "⚪"}.get(trend_dir, "⚪")
+        trend_label = {"UP": "上升", "DOWN": "下降", "NEUTRAL": "横盘"}.get(trend_dir, "横盘")
+
+        # 计算盈亏比
+        atr_pct = get_atr_percent(sym)
+        if signal_type == "LONG":
+            sl = alt_price * (1 - atr_pct * ATR_STOP_MULTIPLIER / 100)
+            tp = alt_price * (1 + atr_pct * ATR_TAKE_MULTIPLIER / 100)
+            rr = (tp - alt_price) / (alt_price - sl) if (alt_price - sl) > 0 else 0
+        else:
+            sl = alt_price * (1 + atr_pct * ATR_STOP_MULTIPLIER / 100)
+            tp = alt_price * (1 - atr_pct * ATR_TAKE_MULTIPLIER / 100)
+            rr = (alt_price - tp) / (sl - alt_price) if (sl - alt_price) > 0 else 0
+
+        # 建议仓位
+        position_size = calculate_position(alt_price, atr_pct, score)
+
+        alert_text = (
+            f"{emoji} 【{level}·{action}】[{sym}]({okx_url})\n"
+            f"评分: {score:.1f}/100\n"
+            f"趋势: {trend_emoji} {trend_label}\n"
+            f"价格: ${alt_price:.4f}\n"
+            f"📊 {details}\n"
+            f"止损: ${sl:.4f} | 止盈: ${tp:.4f} | 盈亏比: {rr:.1f}:1\n"
+            f"建议仓位: {position_size} 张 (杠杆{current_leverage}x)"
+        )
+
+        alerts.append(alert_text)
 
     if alerts:
         header = f"📊 BTC: ${btc_price:.2f} | 24h: {btc_change:+.2f}%\n" + "="*30 + "\n"
-        full_msg = header + "\n\n".join([a["text"] for a in alerts])
+        full_msg = header + "\n\n".join(alerts)
         send_telegram(full_msg, parse_mode='Markdown')
 
+        # 记录待验证信号
         with PENDING_LOCK:
             for a in alerts:
-                PENDING_SIGNALS.append({
-                    "symbol": a["symbol"],
-                    "signal_type": a["signal_type"],
-                    "price": a["price"],
-                    "timestamp": time.time(),
-                    "verified": False,
-                    "status": "pending"
-                })
+                # 提取币种（从消息中解析，简单处理）
+                # 由于消息格式固定，提取 [sym] 中的内容
+                import re
+                match = re.search(r'【.*?】([A-Z]+-[A-Z]+)', a)
+                if match:
+                    sym = match.group(1)
+                    PENDING_SIGNALS.append({
+                        "symbol": sym,
+                        "signal_type": "LONG" if "做多" in a else "SHORT",
+                        "price": float(re.search(r'价格: \$([\d.]+)', a).group(1)) if re.search(r'价格: \$([\d.]+)', a) else 0,
+                        "timestamp": time.time(),
+                        "verified": False,
+                        "status": "pending"
+                    })
 
 # ==================== 验证循环 ====================
 def verify_loop():
@@ -1407,13 +586,11 @@ def verify_loop():
                             with STATS_LOCK:
                                 VERIFY_STATS["total"] += 1
                                 VERIFY_STATS["success"] += 1
-                            update_signal_history(signal.get('score', 0), True)
                         else:
                             signal["status"] = "failed"
                             with STATS_LOCK:
                                 VERIFY_STATS["total"] += 1
                                 VERIFY_STATS["failed"] += 1
-                            update_signal_history(signal.get('score', 0), False)
                     else:
                         signal["status"] = "expired"
                         with STATS_LOCK:
@@ -1426,7 +603,7 @@ def verify_loop():
             for idx in sorted(to_remove, reverse=True):
                 PENDING_SIGNALS.pop(idx)
 
-# ==================== WebSocket ====================
+# ==================== WebSocket（仅订阅tickers） ====================
 def restart_websocket():
     global ws_instance, restart_flag
     with ws_lock:
@@ -1501,8 +678,6 @@ def add_symbol(symbol):
         return False
     alt_symbols.add(symbol)
     price_data[symbol] = {"price": 0, "change": 0, "volume": 0}
-    diff_history[symbol] = []
-    price_candle_cache[symbol] = []
     restart_websocket()
     return True
 
@@ -1511,8 +686,6 @@ def remove_symbol(symbol):
         return False
     alt_symbols.remove(symbol)
     price_data.pop(symbol, None)
-    diff_history.pop(symbol, None)
-    price_candle_cache.pop(symbol, None)
     restart_websocket()
     return True
 
@@ -1522,8 +695,6 @@ def clear_alts():
     for sym in list(alt_symbols):
         alt_symbols.remove(sym)
         price_data.pop(sym, None)
-        diff_history.pop(sym, None)
-        price_candle_cache.pop(sym, None)
     restart_websocket()
     return True
 
@@ -1551,8 +722,6 @@ def add_top_n(n):
             if sym not in alt_symbols:
                 alt_symbols.add(sym)
                 price_data[sym] = {"price": 0, "change": 0, "volume": 0}
-                diff_history[sym] = []
-                price_candle_cache[sym] = []
                 added.append(sym)
         if added:
             restart_websocket()
@@ -1579,8 +748,6 @@ def auto_scan_new_coins():
                         if sym not in alt_symbols:
                             alt_symbols.add(sym)
                             price_data[sym] = {"price": 0, "change": 0, "volume": 0}
-                            diff_history[sym] = []
-                            price_candle_cache[sym] = []
                     known_symbols.update(new_coins)
                     restart_websocket()
                     send_telegram(f"🆕 自动发现新合约币种并已添加监控: {', '.join(new_coins)}")
@@ -1620,13 +787,9 @@ def auto_filter_coins():
                 for sym in to_remove:
                     alt_symbols.remove(sym)
                     price_data.pop(sym, None)
-                    diff_history.pop(sym, None)
-                    price_candle_cache.pop(sym, None)
                 for sym in to_add:
                     alt_symbols.add(sym)
                     price_data[sym] = {"price": 0, "change": 0, "volume": 0}
-                    diff_history[sym] = []
-                    price_candle_cache[sym] = []
                 restart_websocket()
                 msg = (
                     f"🔄 自动过滤已更新监控列表\n"
@@ -1671,8 +834,6 @@ def volatility_scanner():
                         if symbol not in alt_symbols:
                             alt_symbols.add(symbol)
                             price_data[symbol] = {"price": current_price, "change": 0, "volume": 0}
-                            diff_history[symbol] = []
-                            price_candle_cache[symbol] = []
                 cache[symbol] = current_price
             if alerts:
                 msg = "🚨 **突发异动警报（小币种）**\n"
@@ -1683,80 +844,6 @@ def volatility_scanner():
                 restart_websocket()
         except Exception as e:
             print(f"波动扫描出错: {e}")
-
-# ==================== 独立行情 ====================
-def independent_scanner():
-    cache = {}
-    while True:
-        time.sleep(60)
-        if not INDEPENDENT_MODE_ENABLED:
-            continue
-        btc = price_data.get(BTC_SYMBOL)
-        if not btc or abs(btc["change"]) > BTC_TREND_THRESHOLD:
-            continue
-        try:
-            resp = requests.get("https://www.okx.com/api/v5/market/tickers?instType=SPOT", timeout=10)
-            data = resp.json()
-            if data["code"] != "0":
-                continue
-            now = time.time()
-            alerts = []
-            swap_symbols = get_swap_symbols()
-            for item in data["data"]:
-                symbol = item["instId"]
-                if not symbol.endswith("-USDT") or symbol == BTC_SYMBOL:
-                    continue
-                current_price = float(item["last"])
-                if symbol not in cache:
-                    cache[symbol] = {"price": current_price, "time": now, "processed": False}
-                    continue
-                prev = cache[symbol]
-                elapsed = (now - prev["time"]) / 60
-                if elapsed > INDEPENDENT_LOOKBACK + 2:
-                    cache[symbol] = {"price": current_price, "time": now, "processed": False}
-                    continue
-                if prev.get("processed", False):
-                    continue
-                price_change = (current_price - prev["price"]) / prev["price"] * 100
-                if abs(price_change) >= INDEPENDENT_THRESHOLD:
-                    signal_type, score, details = analyze_signal(
-                        symbol, diff=0, btc_change=0, alt_change=price_change,
-                        volume=float(item.get("volCcy24h", 0)),
-                        current_price=current_price,
-                        use_independent=True
-                    )
-                    if signal_type and score >= MIN_SCORE_THRESHOLD:
-                        emoji = "🟢" if signal_type == "LONG" else "🔴"
-                        action = "做多" if signal_type == "LONG" else "做空"
-                        inst_id = symbol
-                        if inst_id in swap_symbols:
-                            okx_url = f"https://www.okx.com/zh-hans/trade-swap/{inst_id.lower()}"
-                        else:
-                            okx_url = f"https://www.okx.com/zh-hans/markets/spot/{inst_id.lower()}"
-                        alerts.append(
-                            f"{emoji} 【独立信号·{action}】[{symbol}]({okx_url})\n"
-                            f"15分钟 {price_change:+.2f}% | 现价: ${current_price:.4f}\n"
-                            f"评分: {score:.2f}/100\n"
-                            f"📊 {details}"
-                        )
-                        if symbol not in alt_symbols:
-                            alt_symbols.add(symbol)
-                            price_data[symbol] = {"price": current_price, "change": 0, "volume": 0}
-                            diff_history[symbol] = []
-                            price_candle_cache[symbol] = []
-                    cache[symbol]["processed"] = True
-                    cache[symbol]["price"] = current_price
-                    cache[symbol]["time"] = now
-                else:
-                    cache[symbol]["price"] = current_price
-                    cache[symbol]["time"] = now
-            if alerts:
-                header = f"📊 BTC 横盘（24h: {btc['change']:+.2f}%），独立行情监控\n" + "="*30 + "\n"
-                send_telegram(header + "\n\n".join(alerts[:5]), parse_mode='Markdown')
-                if any("已自动加入" in a for a in alerts):
-                    restart_websocket()
-        except Exception as e:
-            print(f"独立行情监控出错: {e}")
 
 # ==================== 汇总 ====================
 def generate_summary():
@@ -1824,18 +911,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         f"🤖 **合约胜率增强Bot v{VERSION}**\n"
-        "动量突破 + 资金流预判 + 多因子共振\n\n"
+        "核心逻辑：趋势 + 背离 + 成交量 + RSI + 费率\n\n"
         "📊 **命令**：\n"
         "/status – 状态 & 参数\n"
         "/summary – 强弱汇总\n"
         "/autorefresh on/off – 自动刷新\n"
         "/addcoin / addtop – 管理币种\n"
-        "/setdiff – 调整 Z-Score 基础阈值\n"
-        "/setvol – 成交量阈值\n"
-        "/setvolatility – 波动扫描阈值\n"
-        "/setleverage – 设置杠杆倍数\n"
-        "/setthreshold – 设置评分推送阈值（0~100）\n"
-        "/sentiment – 市场情绪指数\n"
+        "/setthreshold <0~100> – 设置评分推送阈值\n"
+        "/setleverage <倍数> – 设置杠杆\n"
         "/debug – BTC数据\n"
         "/refreshbalance – 强制刷新余额\n"
         "/help – 此帮助",
@@ -1859,26 +942,11 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         failed = VERIFY_STATS["failed"]
         expired = VERIFY_STATS["expired"]
         success_rate = f"{success/total*100:.1f}%" if total > 0 else "N/A"
-        hist_total = len(SIGNAL_HISTORY)
-        hist_success = sum(1 for s in SIGNAL_HISTORY if s["success"])
-        hist_rate = f"{hist_success/hist_total*100:.1f}%" if hist_total > 0 else "N/A"
-    filter_status = "🟢 开启" if AUTO_FILTER_ENABLED else "🔴 关闭"
-    volatility_status = "🟢 开启" if VOLATILITY_SCAN_ENABLED else "🔴 关闭"
-    independent_status = "🟢 开启" if INDEPENDENT_MODE_ENABLED else "🔴 关闭"
-    sentiment = get_market_sentiment()
-    dyn_long = get_dynamic_zscore_threshold("BTC-USDT", "LONG")
-    dyn_short = get_dynamic_zscore_threshold("BTC-USDT", "SHORT")
     balance = get_usdt_balance()
-    stablecoin = get_stablecoin_data()
-    premium = get_coinbase_premium()
-    brk = get_brk_exchange_balance()
     msg = (
         f"📋 监控: {count} 个山寨币（仅合约）\n"
         f"自动刷新: {status_auto}"
         f"{f' (间隔 {interval_min} 分钟)' if auto_refresh_enabled else ''}\n"
-        f"自动过滤: {filter_status} (保留前 {MAX_COINS} 名)\n"
-        f"波动扫描: {volatility_status} (阈值 {VOLATILITY_THRESHOLD}%)\n"
-        f"独立行情: {independent_status} (阈值 {INDEPENDENT_THRESHOLD}%)\n"
         f"待验证信号: {pending_count} 个\n"
         f"💰 USDT余额: ${balance:,.2f}\n"
         f"⚡ 当前杠杆: {current_leverage}x\n"
@@ -1886,18 +954,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 近24小时验证统计:\n"
         f"  总数: {total} | ✅成功: {success} | ❌失败: {failed} | ⏳失效: {expired}\n"
         f"  成功率: {success_rate}\n"
-        f"📈 近50单历史成功率: {hist_rate} ({hist_total} 笔)\n"
-        f"📊 市场情绪: {sentiment}/100 ({'极度恐惧' if sentiment<30 else '贪婪' if sentiment>70 else '中性'})\n"
-        f"💰 稳定币: USDT {stablecoin['usdt']:.0f}亿 | USDC {stablecoin['usdc']:.0f}亿\n"
-        f"🏦 Coinbase溢价: {premium:+.2f}%\n"
-        f"🏦 交易所余额变化: {brk['change']:+.2f}%\n\n"
-        f"⚙️ 评分参数：\n"
-        f"动态阈值: 多 {dyn_long:.2f} / 空 {dyn_short:.2f}\n"
-        f"基础Z-Score: 多 {ZSCORE_BASE_LONG} / 空 {ZSCORE_BASE_SHORT}\n"
-        f"RSI超买/超卖: {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
-        f"成交量阈值: {VOLUME_THRESHOLD/1000000:.1f}M\n"
-        f"趋势过滤: {'🟢 开启' if ENABLE_TREND_FILTER else '🔴 关闭'}\n"
-        f"动量突破: {'🟢 开启' if ENABLE_MOMENTUM_BREAKOUT else '🔴 关闭'}"
+        f"⏰ 信号冷却: {COOLDOWN_HOURS}小时 (同币同向)"
     )
     msg += "\n\n列表: " + ", ".join(list(alt_symbols)[:15])
     if count > 15:
@@ -2000,75 +1057,31 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("⚠️ 列表已空", reply_markup=get_main_keyboard())
 
-async def setdiff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global ZSCORE_BASE_LONG, ZSCORE_BASE_SHORT
+async def setthreshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global MIN_SCORE_THRESHOLD
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
         return
     if not context.args:
         await update.message.reply_text(
-            f"📊 当前基础 Z-Score 阈值: 多 {ZSCORE_BASE_LONG} / 空 {ZSCORE_BASE_SHORT}\n"
-            "用法: /setdiff <做多基础阈值> <做空基础阈值>\n"
-            "示例: /setdiff 1.5 -1.5（更敏感）",
+            f"📊 当前评分推送阈值: {MIN_SCORE_THRESHOLD}\n"
+            "用法: /setthreshold <数值>（如 /setthreshold 60）\n"
+            "范围: 0~100，低于阈值不推送信号",
             reply_markup=get_main_keyboard()
         )
         return
     try:
-        long_val = float(context.args[0])
-        short_val = float(context.args[1]) if len(context.args) > 1 else -long_val
-        if long_val < 0.5 or long_val > 4.0 or short_val > -0.5 or short_val < -4.0:
-            await update.message.reply_text("⚠️ 范围 0.5~4.0 和 -0.5~-4.0", reply_markup=get_main_keyboard())
+        val = int(context.args[0])
+        if val < 0 or val > 100:
+            await update.message.reply_text("⚠️ 阈值范围应在 0~100 之间", reply_markup=get_main_keyboard())
             return
-        ZSCORE_BASE_LONG = long_val
-        ZSCORE_BASE_SHORT = short_val
+        MIN_SCORE_THRESHOLD = val
         await update.message.reply_text(
-            f"✅ 基础 Z-Score 已更新\n"
-            f"做多: {ZSCORE_BASE_LONG} | 做空: {ZSCORE_BASE_SHORT}",
+            f"✅ 评分推送阈值已更新为 {MIN_SCORE_THRESHOLD}\n"
+            f"（评分 >= {MIN_SCORE_THRESHOLD} 的信号才会推送）",
             reply_markup=get_main_keyboard()
         )
     except ValueError:
-        await update.message.reply_text("⚠️ 请输入有效数字", reply_markup=get_main_keyboard())
-
-async def setvol(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global VOLUME_THRESHOLD
-    if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
-        return
-    if not context.args:
-        await update.message.reply_text(
-            f"📊 当前成交量阈值: {VOLUME_THRESHOLD/1000000:.1f}M USDT\n"
-            "用法: /setvol <数值>（单位：百万）",
-            reply_markup=get_main_keyboard()
-        )
-        return
-    try:
-        val = float(context.args[0])
-        if val < 0.1 or val > 20:
-            await update.message.reply_text("⚠️ 范围 0.1~20M", reply_markup=get_main_keyboard())
-            return
-        VOLUME_THRESHOLD = val * 1000000
-        await update.message.reply_text(f"✅ 成交量阈值已更新为 {val:.1f}M USDT", reply_markup=get_main_keyboard())
-    except ValueError:
-        await update.message.reply_text("⚠️ 请输入有效数字", reply_markup=get_main_keyboard())
-
-async def setvolatility(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global VOLATILITY_THRESHOLD
-    if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
-        return
-    if not context.args:
-        await update.message.reply_text(
-            f"📊 当前波动扫描阈值: {VOLATILITY_THRESHOLD}%\n"
-            "用法: /setvolatility <数值>（如 3.5）",
-            reply_markup=get_main_keyboard()
-        )
-        return
-    try:
-        new_threshold = float(context.args[0])
-        if new_threshold < 0.5 or new_threshold > 20:
-            await update.message.reply_text("⚠️ 范围 0.5%~20%", reply_markup=get_main_keyboard())
-            return
-        VOLATILITY_THRESHOLD = new_threshold
-        await update.message.reply_text(f"✅ 波动扫描阈值已更新为 {VOLATILITY_THRESHOLD}%", reply_markup=get_main_keyboard())
-    except ValueError:
-        await update.message.reply_text("⚠️ 请输入有效数字", reply_markup=get_main_keyboard())
+        await update.message.reply_text("⚠️ 请输入有效整数，如 /setthreshold 60", reply_markup=get_main_keyboard())
 
 async def setleverage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global current_leverage
@@ -2091,58 +1104,12 @@ async def setleverage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("⚠️ 请输入有效整数", reply_markup=get_main_keyboard())
 
-async def setthreshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global MIN_SCORE_THRESHOLD
-    if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
-        return
-    if not context.args:
-        await update.message.reply_text(
-            f"📊 当前评分阈值: {MIN_SCORE_THRESHOLD}\n"
-            "用法: /setthreshold <数值>（如 /setthreshold 80）\n"
-            "范围: 0~100，低于阈值不推送信号",
-            reply_markup=get_main_keyboard()
-        )
-        return
-    try:
-        val = int(context.args[0])
-        if val < 0 or val > 100:
-            await update.message.reply_text("⚠️ 阈值范围应在 0~100 之间", reply_markup=get_main_keyboard())
-            return
-        MIN_SCORE_THRESHOLD = val
-        await update.message.reply_text(
-            f"✅ 评分推送阈值已更新为 {MIN_SCORE_THRESHOLD}\n"
-            f"（评分 >= {MIN_SCORE_THRESHOLD} 的信号才会推送）",
-            reply_markup=get_main_keyboard()
-        )
-    except ValueError:
-        await update.message.reply_text("⚠️ 请输入有效整数，如 /setthreshold 80", reply_markup=get_main_keyboard())
-
-async def sentiment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
-        return
-    sentiment_val = get_market_sentiment()
-    if sentiment_val < 30:
-        level = "🔴 极度恐惧 (Fear)"
-    elif sentiment_val < 45:
-        level = "🟠 恐惧"
-    elif sentiment_val <= 55:
-        level = "⚪ 中性"
-    elif sentiment_val <= 70:
-        level = "🟡 贪婪"
-    else:
-        level = "🟢 极度贪婪 (Greed)"
-    msg = f"📊 **市场情绪指数**: {sentiment_val}/100\n{level}"
-    await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
-
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
         return
     btc = price_data.get(BTC_SYMBOL)
     if btc:
         balance = get_usdt_balance()
-        stablecoin = get_stablecoin_data()
-        premium = get_coinbase_premium()
-        brk = get_brk_exchange_balance()
         msg = (f"🔍 **BTC 当前数据**\n"
                f"价格: ${btc['price']:.2f}\n"
                f"24h涨跌幅: {btc['change']:.2f}%\n"
@@ -2151,10 +1118,7 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
                f"💰 USDT余额: ${balance:,.2f}\n"
                f"⚡ 当前杠杆: {current_leverage}x\n"
                f"🎯 评分推送阈值: {MIN_SCORE_THRESHOLD}\n"
-               f"稳定币: USDT {stablecoin['usdt']:.0f}亿\n"
-               f"Coinbase溢价: {premium:+.2f}%\n"
-               f"交易所余额变化: {brk['change']:+.2f}%\n"
-               f"历史样本数: {sum(len(v) for v in diff_history.values())}")
+               f"⏰ 信号冷却: {COOLDOWN_HOURS}小时")
     else:
         msg = "❌ 未获取到BTC数据"
     await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
@@ -2183,12 +1147,8 @@ def run_telegram_bot():
         app.add_handler(CommandHandler("addtop", addtop))
         app.add_handler(CommandHandler("removecoin", removecoin))
         app.add_handler(CommandHandler("clear", clear))
-        app.add_handler(CommandHandler("setdiff", setdiff))
-        app.add_handler(CommandHandler("setvol", setvol))
-        app.add_handler(CommandHandler("setvolatility", setvolatility))
-        app.add_handler(CommandHandler("setleverage", setleverage))
         app.add_handler(CommandHandler("setthreshold", setthreshold))
-        app.add_handler(CommandHandler("sentiment", sentiment))
+        app.add_handler(CommandHandler("setleverage", setleverage))
         app.add_handler(CommandHandler("debug", debug))
         app.add_handler(CommandHandler("refreshbalance", refreshbalance))
         print("🤖 Telegram Bot 正在运行")
@@ -2213,10 +1173,7 @@ def run_http():
 # ==================== 启动通知 ====================
 def send_startup_notification():
     time.sleep(8)
-    sentiment_val = get_market_sentiment()
     balance = get_usdt_balance()
-    stablecoin = get_stablecoin_data()
-    premium = get_coinbase_premium()
     msg = (
         f"🚀 **Bot 已重新启动！**\n"
         f"版本: {VERSION}\n"
@@ -2225,12 +1182,7 @@ def send_startup_notification():
         f"💰 USDT余额: ${balance:,.2f}\n"
         f"⚡ 当前杠杆: {current_leverage}x\n"
         f"🎯 评分推送阈值: {MIN_SCORE_THRESHOLD}\n"
-        f"市场情绪: {sentiment_val}/100\n"
-        f"稳定币: USDT {stablecoin['usdt']:.0f}亿\n"
-        f"Coinbase溢价: {premium:+.2f}%\n"
-        f"动态阈值: 多 {get_dynamic_zscore_threshold('BTC-USDT', 'LONG'):.2f} / 空 {get_dynamic_zscore_threshold('BTC-USDT', 'SHORT'):.2f}\n"
-        f"趋势过滤: {'🟢 开启' if ENABLE_TREND_FILTER else '🔴 关闭'}\n"
-        f"动量突破: {'🟢 开启' if ENABLE_MOMENTUM_BREAKOUT else '🔴 关闭'}\n"
+        f"⏰ 信号冷却: {COOLDOWN_HOURS}小时\n"
         f"使用 /status 查看详情"
     )
     send_telegram(msg)
@@ -2239,19 +1191,15 @@ def send_startup_notification():
 if __name__ == "__main__":
     print(f"🚀 合约胜率增强版 v{VERSION} 启动于 {datetime.now(timezone.utc)}")
     print(f"初始监控: {BTC_SYMBOL} + {', '.join(DEFAULT_ALT_SYMBOLS)}")
-    print(f"基础 Z-Score 阈值: 多 {ZSCORE_BASE_LONG} / 空 {ZSCORE_BASE_SHORT}")
     print(f"默认杠杆: {DEFAULT_LEVERAGE}x")
     print(f"自动过滤: 保留前 {MAX_COINS} 名")
-    print(f"趋势过滤: {'🟢 开启' if ENABLE_TREND_FILTER else '🔴 关闭'}")
-    print(f"动量突破: {'🟢 开启' if ENABLE_MOMENTUM_BREAKOUT else '🔴 关闭'}")
     print(f"评分推送阈值: {MIN_SCORE_THRESHOLD}")
-    print("📊 数据源: OKX + DeFi Llama + BRK + Coinbase")
+    print(f"信号冷却: {COOLDOWN_HOURS}小时")
 
     threading.Thread(target=verify_loop, daemon=True).start()
     threading.Thread(target=auto_scan_new_coins, daemon=True).start()
     threading.Thread(target=auto_filter_coins, daemon=True).start()
     threading.Thread(target=volatility_scanner, daemon=True).start()
-    threading.Thread(target=independent_scanner, daemon=True).start()
     threading.Thread(target=start_ws, daemon=True).start()
 
     http_thread = threading.Thread(target=run_http, daemon=True)
