@@ -424,7 +424,7 @@ def analyze_signal(symbol, current_price, volume, alt_change, btc_change):
         else:
             funding_score = 0
 
-    # ---- 6. 乖离率（v3.5 核心新增，避免追高接盘） ----
+    # ---- 6. 乖离率（v3.5 核心新增） ----
     bias_score, bias_pct, bias_desc = get_bias_score(current_price, ema50, signal_type)
     
     # ---- 综合评分 ----
