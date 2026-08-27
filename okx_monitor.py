@@ -8,12 +8,13 @@ import requests
 import time
 import threading
 from datetime import datetime, timedelta, timezone
+from collections import deque
 from flask import Flask
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==================== 版本信息 ====================
-VERSION = "1.10.2"  # 增强余额刷新 + 手动刷新命令 + 冲突修复
+VERSION = "1.11.1"  # 修复跳转链接路径，增加合约检测回退
 
 # ==================== 配置区 ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -44,11 +45,16 @@ ZSCORE_MIN = 1.0
 ZSCORE_MAX = 2.5
 WHALE_VOLUME_THRESHOLD = 3.0
 RISK_PER_TRADE = 0.02
-ACCOUNT_BALANCE = 10000  # 当 API 获取失败时的默认值
+ACCOUNT_BALANCE = 0       # 已改为 0，API 正常时读取真实余额
 PRICE_TRAP_THRESHOLD = 0.005
 
 # ==================== v1.10.0 配置 ====================
 OI_CHANGE_THRESHOLD = 10.0
+
+# ==================== v1.11.0 新增配置 ====================
+DEFAULT_LEVERAGE = 3          # 默认杠杆倍数（可通过命令调整）
+LIQUIDATION_LOOKBACK = 24     # 爆仓统计小时数
+FUNDING_HISTORY_LENGTH = 24   # 费率历史记录数量（每小时一个）
 
 # ==================== 验证配置 ====================
 VERIFY_MINUTES = 15
@@ -91,9 +97,14 @@ auto_refresh_interval = 300
 auto_refresh_timer = None
 price_candle_cache = {}
 
-# 缓存 USDT 余额，减少 API 调用（TTL 60 秒）
+# 缓存 USDT 余额
 usdt_balance_cache = {"balance": 0, "timestamp": 0, "valid": False}
-BALANCE_CACHE_TTL = 60  # 60 秒缓存，平衡实时性与 API 频率
+BALANCE_CACHE_TTL = 60
+
+# ---- v1.11.0 新增全局状态 ----
+current_leverage = DEFAULT_LEVERAGE
+funding_history = {}   # {symbol: deque(maxlen=FUNDING_HISTORY_LENGTH)}
+liquidation_cache = {} # {symbol: {"volume": 0, "timestamp": 0}}
 
 # ==================== 菜单键盘 ====================
 def get_main_keyboard():
@@ -103,8 +114,9 @@ def get_main_keyboard():
         [KeyboardButton("/addcoin"), KeyboardButton("/addtop")],
         [KeyboardButton("/removecoin"), KeyboardButton("/clear")],
         [KeyboardButton("/setdiff"), KeyboardButton("/setvol")],
-        [KeyboardButton("/setvolatility"), KeyboardButton("/sentiment")],
-        [KeyboardButton("/debug"), KeyboardButton("/refreshbalance"), KeyboardButton("/help")]
+        [KeyboardButton("/setvolatility"), KeyboardButton("/setleverage")],
+        [KeyboardButton("/sentiment"), KeyboardButton("/debug")],
+        [KeyboardButton("/refreshbalance"), KeyboardButton("/help")]
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
 
@@ -122,7 +134,7 @@ def send_telegram(msg, parse_mode=None):
     except Exception as e:
         print(f"推送失败: {e}")
 
-# ==================== OKX API 签名工具（只读） ====================
+# ==================== OKX API 签名工具 ====================
 def generate_sign(timestamp, method, request_path, body, secret_key):
     message = timestamp + method + request_path + body
     mac = hmac.new(
@@ -133,35 +145,22 @@ def generate_sign(timestamp, method, request_path, body, secret_key):
     return base64.b64encode(mac.digest()).decode('utf-8')
 
 def get_usdt_balance(force_refresh=False):
-    """
-    使用只读 API 获取 USDT 可用余额
-    若 force_refresh=True，强制重新请求并更新缓存
-    若未配置 API 或请求失败，返回 ACCOUNT_BALANCE
-    """
     global usdt_balance_cache
-
     api_key = os.environ.get("OKX_API_KEY")
     secret_key = os.environ.get("OKX_SECRET_KEY")
     passphrase = os.environ.get("OKX_PASSPHRASE")
-
     if not api_key or not secret_key or not passphrase:
-        print("⚠️ OKX API 密钥未配置，使用默认余额")
         return ACCOUNT_BALANCE
-
     now = time.time()
     if not force_refresh and usdt_balance_cache["valid"] and (now - usdt_balance_cache["timestamp"]) < BALANCE_CACHE_TTL:
         return usdt_balance_cache["balance"]
-
     try:
-        # 生成 ISO 8601 时间戳（手动构造，确保三位毫秒）
         dt = datetime.now(timezone.utc)
         timestamp = dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
         method = "GET"
         request_path = "/api/v5/account/balance?ccy=USDT"
         url = "https://www.okx.com" + request_path
-
         sign = generate_sign(timestamp, method, request_path, "", secret_key)
-
         headers = {
             "OK-ACCESS-KEY": api_key,
             "OK-ACCESS-SIGN": sign,
@@ -169,13 +168,8 @@ def get_usdt_balance(force_refresh=False):
             "OK-ACCESS-PASSPHRASE": passphrase,
             "Content-Type": "application/json",
         }
-
         resp = requests.get(url, headers=headers, timeout=5)
         data = resp.json()
-
-        print(f"📦 API 响应状态码: {resp.status_code}")
-        print(f"📦 API 响应内容: {data}")
-
         if data.get("code") == "0":
             for detail in data["data"][0]["details"]:
                 if detail["ccy"] == "USDT":
@@ -183,23 +177,73 @@ def get_usdt_balance(force_refresh=False):
                     usdt_balance_cache["balance"] = balance
                     usdt_balance_cache["timestamp"] = now
                     usdt_balance_cache["valid"] = True
-                    print(f"✅ 获取USDT余额成功: {balance}")
                     return balance
-            print("⚠️ 响应中未找到 USDT 余额")
             return 0.0
         else:
             print(f"⚠️ API 返回错误: {data.get('msg', '未知错误')}")
             return ACCOUNT_BALANCE
-
     except Exception as e:
         print(f"⚠️ 获取USDT余额异常: {e}")
         return ACCOUNT_BALANCE
 
 def refresh_balance_cache():
-    """强制刷新余额缓存"""
     global usdt_balance_cache
     usdt_balance_cache["valid"] = False
     return get_usdt_balance(force_refresh=True)
+
+# ==================== v1.11.0 新增工具函数 ====================
+def get_liquidation_volume(symbol, hours=24):
+    """
+    获取指定合约的 24h 爆仓量（USDT）
+    返回浮点数（USDT）
+    """
+    try:
+        swap_symbol = symbol.replace("-USDT", "-USDT-SWAP")
+        url = f"https://www.okx.com/api/v5/public/liquidation?instType=SWAP&instId={swap_symbol}&limit=100"
+        resp = requests.get(url, timeout=5)
+        data = resp.json()
+        if data.get("code") != "0":
+            return 0.0
+        total = 0.0
+        now = time.time()
+        for item in data.get("data", []):
+            ts = int(item.get("ts", 0)) / 1000
+            if now - ts > hours * 3600:
+                continue
+            side = item.get("side", "")
+            size = abs(float(item.get("size", 0)))
+            price = float(item.get("avgPx", 0))
+            total += size * price
+        return total
+    except Exception as e:
+        print(f"获取爆仓量失败 {symbol}: {e}")
+        return 0.0
+
+def update_funding_history(symbol):
+    """获取当前费率并存入历史"""
+    try:
+        swap_symbol = symbol.replace("-USDT", "-USDT-SWAP")
+        url = f"https://www.okx.com/api/v5/public/funding-rate?instId={swap_symbol}"
+        resp = requests.get(url, timeout=3)
+        data = resp.json()
+        if data.get("code") == "0" and data["data"]:
+            rate = float(data["data"][0]["fundingRate"])
+            if symbol not in funding_history:
+                funding_history[symbol] = deque(maxlen=FUNDING_HISTORY_LENGTH)
+            funding_history[symbol].append(rate)
+    except:
+        pass
+
+def get_funding_zscore(symbol, current_rate):
+    """计算当前费率的 z-score，基于历史数据"""
+    history = funding_history.get(symbol, [])
+    if len(history) < 6:
+        return 0.0
+    mean = sum(history) / len(history)
+    std = (sum((x - mean) ** 2 for x in history) / len(history)) ** 0.5
+    if std == 0:
+        return 0.0
+    return (current_rate - mean) / std
 
 # ==================== 基础工具函数 ====================
 def get_swap_symbols():
@@ -326,7 +370,7 @@ def get_oi_change(symbol):
     except:
         return 0.0, False
 
-# ==================== 全面感知函数 ====================
+# ==================== 全面感知函数（保持不变） ====================
 def get_market_sentiment():
     try:
         main_coins = ["BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT"]
@@ -594,19 +638,17 @@ def get_liquidity_trap_score(symbol, current_price):
     except:
         return 0, ""
 
-def calculate_position(current_price, atr_pct, score, account_balance=None):
-    """
-    计算建议合约张数
-    若 account_balance 为 None，则通过只读 API 动态获取 USDT 余额
-    """
+def calculate_position(current_price, atr_pct, score, account_balance=None, leverage=None):
     if account_balance is None:
         account_balance = get_usdt_balance()
+    if leverage is None:
+        leverage = current_leverage
     if atr_pct <= 0:
         atr_pct = 0.5
     stop_loss_pct = atr_pct * 1.5
     risk_amount = account_balance * RISK_PER_TRADE
     adjusted_risk = risk_amount * (0.5 + (score / 100) * 0.5)
-    contract_size = adjusted_risk / (current_price * (stop_loss_pct / 100))
+    contract_size = (adjusted_risk * leverage) / (current_price * (stop_loss_pct / 100))
     return max(1, int(contract_size))
 
 def get_session_score():
@@ -656,7 +698,8 @@ def get_zscore(symbol, current_diff):
         return 0
     return (current_diff - mean) / std
 
-# ==================== 核心评分 ====================
+# ---- Part 1 结束，请继续复制 Part 2 ----
+# ==================== 核心评分（集成 v1.11.0 新因子） ====================
 def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, use_independent=False):
     if use_independent:
         if alt_change > 0:
@@ -689,6 +732,7 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
     details = []
     score = 0
 
+    # ---- 基础分 ----
     if use_independent:
         base_score = min(50, 30 + abs(alt_change) * 8)
         details.append(f"独立波动 {alt_change:+.2f}% (基础分{base_score:.0f})")
@@ -697,6 +741,7 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
         details.append(f"背离差 {diff:+.2f}% (基础分{base_score:.0f})")
     score += base_score
 
+    # ---- EMA50 ----
     ema50 = get_ema(symbol)
     if ema50 > 0:
         if signal_type == "LONG":
@@ -718,6 +763,7 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
             else:
                 details.append("EMA50附近")
 
+    # ---- RSI ----
     rsi = calculate_rsi(symbol)
     if signal_type == "LONG":
         if rsi > RSI_OVERBOUGHT:
@@ -738,6 +784,7 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
         else:
             details.append(f"RSI={rsi:.0f}中性")
 
+    # ---- 资金费率（基础） ----
     funding = get_funding_rate(symbol)
     if signal_type == "LONG":
         if funding > 0.01:
@@ -758,12 +805,14 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
         else:
             details.append(f"费率{funding*100:.3f}%中性")
 
+    # ---- 成交量 ----
     if volume > VOLUME_THRESHOLD:
         score += 10
         details.append(f"成交额${volume/1000000:.1f}M (+10)")
     else:
         details.append(f"成交额${volume/1000000:.1f}M (一般)")
 
+    # ---- Z-Score 显著性 ----
     if not use_independent and abs(btc_change) >= BTC_TREND_THRESHOLD:
         z = get_zscore(symbol, diff)
         if z is not None:
@@ -786,6 +835,7 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
                 score += 5
                 details.append(f"Z-Score={z:.2f} (+5)")
 
+    # ---- 情绪、板块、共振、深度、ATR、位置、基差、订单簿、鲸鱼、陷阱、时段（v1.8/v1.9） ----
     sentiment = get_market_sentiment()
     if sentiment < 30:
         if signal_type == "LONG":
@@ -911,7 +961,7 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
     entry_advice = get_rsi_entry_advice(symbol, signal_type)
     details.append(f"入场建议：{entry_advice}")
 
-    # ==================== v1.10.0 持仓量变化因子 ====================
+    # ==================== v1.10.0 持仓量变化 ====================
     oi_change, oi_sig = get_oi_change(symbol)
     if signal_type == "LONG" and oi_sig and oi_change > 0:
         score += 10
@@ -928,7 +978,43 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
     else:
         details.append(f"持仓量变化 {oi_change:+.1f}% (中性)")
 
-    # ---- 盈亏比 & 仓位（动态余额） ----
+    # ==================== v1.11.0 新增因子 ====================
+    # ---- 因子：爆仓量监控 ----
+    liq_vol = get_liquidation_volume(symbol)
+    if liq_vol > 0:
+        if liq_vol > 1000000:
+            if signal_type == "LONG":
+                score += 10
+                details.append(f"爆仓量 ${liq_vol/1e6:.1f}M (+10)")
+            else:
+                score -= 5
+                details.append(f"爆仓量 ${liq_vol/1e6:.1f}M (做空-5)")
+        else:
+            details.append(f"爆仓量 ${liq_vol/1e6:.2f}M (中性)")
+
+    # ---- 因子：费率历史标准差 ----
+    current_funding = get_funding_rate(symbol)
+    if current_funding != 0:
+        update_funding_history(symbol)
+        z = get_funding_zscore(symbol, current_funding)
+        if abs(z) > 2.0:
+            if signal_type == "LONG" and z > 2.0:
+                score -= 15
+                details.append(f"费率Z-score={z:.2f} 极端高 (做多-15)")
+            elif signal_type == "SHORT" and z < -2.0:
+                score -= 15
+                details.append(f"费率Z-score={z:.2f} 极端低 (做空-15)")
+            else:
+                if signal_type == "LONG" and z < -2.0:
+                    score += 15
+                    details.append(f"费率Z-score={z:.2f} 极端低 (做多+15)")
+                elif signal_type == "SHORT" and z > 2.0:
+                    score += 15
+                    details.append(f"费率Z-score={z:.2f} 极端高 (做空+15)")
+        else:
+            details.append(f"费率Z-score={z:.2f} (中性)")
+
+    # ---- 盈亏比 & 仓位（含杠杆） ----
     atr_pct = get_atr_percent(symbol)
     if signal_type == "LONG":
         sl = current_price * (1 - atr_pct * 1.5 / 100)
@@ -941,10 +1027,9 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
         rr = (current_price - tp) / (sl - current_price) if (sl - current_price) > 0 else 0
         details.append(f"止损 {sl:.4f} 止盈 {tp:.4f} 盈亏比 {rr:.1f}:1")
 
-    # 使用动态余额计算仓位（若缓存过期会自动刷新）
     balance = get_usdt_balance()
-    position_size = calculate_position(current_price, atr_pct, score, balance)
-    details.append(f"建议仓位：{position_size} 张 (风险{RISK_PER_TRADE*100:.1f}%)")
+    position_size = calculate_position(current_price, atr_pct, score, balance, current_leverage)
+    details.append(f"建议仓位：{position_size} 张 (杠杆{current_leverage}x，风险{RISK_PER_TRADE*100:.1f}%)")
 
     final_score = max(0, min(100, score))
     return signal_type, final_score, " | ".join(details)
@@ -956,6 +1041,9 @@ def check_divergence():
     btc_price = btc["price"]
     alerts = []
     now = time.time()
+
+    # 获取合约列表用于链接回退
+    swap_symbols = get_swap_symbols()
 
     for sym in list(alt_symbols):
         alt = price_data.get(sym)
@@ -982,7 +1070,11 @@ def check_divergence():
             emoji = "🟢" if signal_type == "LONG" else "🔴"
             action = "做多" if signal_type == "LONG" else "做空"
             inst_id = sym
-            okx_url = f"https://www.okx.com/zh-hans/markets/swap/{inst_id.lower()}"
+            # 修复跳转链接：合约路径 + 现货回退
+            if inst_id in swap_symbols:
+                okx_url = f"https://www.okx.com/zh-hans/trade-swap/{inst_id.lower()}"
+            else:
+                okx_url = f"https://www.okx.com/zh-hans/markets/spot/{inst_id.lower()}"
             alert_text = (
                 f"{emoji} 【{action}】[{sym}]({okx_url}) | 评分: {score:.2f}/100\n"
                 f"背离差: {diff:+.2f}% | 价格: ${alt_price:.4f}\n"
@@ -1062,7 +1154,6 @@ def verify_loop():
                             with STATS_LOCK:
                                 VERIFY_STATS["total"] += 1
                                 VERIFY_STATS["success"] += 1
-                            # 使用 .get() 防止 KeyError
                             update_signal_history(signal.get('score', 0), True)
                         else:
                             signal["status"] = "failed"
@@ -1357,6 +1448,7 @@ def independent_scanner():
                 continue
             now = time.time()
             alerts = []
+            swap_symbols = get_swap_symbols()
             for item in data["data"]:
                 symbol = item["instId"]
                 if not symbol.endswith("-USDT") or symbol == BTC_SYMBOL:
@@ -1384,7 +1476,11 @@ def independent_scanner():
                         emoji = "🟢" if signal_type == "LONG" else "🔴"
                         action = "做多" if signal_type == "LONG" else "做空"
                         inst_id = symbol
-                        okx_url = f"https://www.okx.com/zh-hans/markets/swap/{inst_id.lower()}"
+                        # 修复链接
+                        if inst_id in swap_symbols:
+                            okx_url = f"https://www.okx.com/zh-hans/trade-swap/{inst_id.lower()}"
+                        else:
+                            okx_url = f"https://www.okx.com/zh-hans/markets/spot/{inst_id.lower()}"
                         alerts.append(
                             f"{emoji} 【独立信号·{action}】[{symbol}]({okx_url})\n"
                             f"15分钟 {price_change:+.2f}% | 现价: ${current_price:.4f}\n"
@@ -1476,7 +1572,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         f"🤖 **合约胜率增强Bot v{VERSION}**\n"
-        "自适应阈值 + 订单簿不平衡 + 持仓量变化 + 动态余额\n\n"
+        "自适应阈值 + 订单簿不平衡 + 持仓量变化 + 爆仓监控 + 费率历史\n\n"
         "📊 **命令**：\n"
         "/status – 状态 & 参数\n"
         "/summary – 强弱汇总\n"
@@ -1485,9 +1581,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/setdiff – 调整 Z-Score 基础阈值\n"
         "/setvol – 成交量阈值\n"
         "/setvolatility – 波动扫描阈值\n"
+        "/setleverage – 设置杠杆倍数\n"
         "/sentiment – 市场情绪指数\n"
         "/debug – BTC数据\n"
-        "/refreshbalance – 强制刷新USDT余额\n"
+        "/refreshbalance – 强制刷新余额\n"
         "/help – 此帮助",
         reply_markup=get_main_keyboard(),
         parse_mode='Markdown'
@@ -1518,7 +1615,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sentiment = get_market_sentiment()
     dyn_long = get_dynamic_zscore_threshold("BTC-USDT", "LONG")
     dyn_short = get_dynamic_zscore_threshold("BTC-USDT", "SHORT")
-    balance = get_usdt_balance()  # 可能使用缓存
+    balance = get_usdt_balance()
     msg = (
         f"📋 监控: {count} 个山寨币（仅合约）\n"
         f"自动刷新: {status_auto}"
@@ -1528,6 +1625,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"独立行情: {independent_status} (阈值 {INDEPENDENT_THRESHOLD}%)\n"
         f"待验证信号: {pending_count} 个\n"
         f"💰 USDT余额: ${balance:,.2f}\n"
+        f"⚡ 当前杠杆: {current_leverage}x\n"
         f"📊 近24小时验证统计:\n"
         f"  总数: {total} | ✅成功: {success} | ❌失败: {failed} | ⏳失效: {expired}\n"
         f"  成功率: {success_rate}\n"
@@ -1710,6 +1808,27 @@ async def setvolatility(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("⚠️ 请输入有效数字", reply_markup=get_main_keyboard())
 
+async def setleverage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global current_leverage
+    if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            f"📊 当前杠杆: {current_leverage}x\n"
+            "用法: /setleverage <倍数>（如 /setleverage 5）",
+            reply_markup=get_main_keyboard()
+        )
+        return
+    try:
+        lev = int(context.args[0])
+        if lev < 1 or lev > 100:
+            await update.message.reply_text("⚠️ 杠杆范围 1~100", reply_markup=get_main_keyboard())
+            return
+        current_leverage = lev
+        await update.message.reply_text(f"✅ 杠杆已设置为 {current_leverage}x", reply_markup=get_main_keyboard())
+    except ValueError:
+        await update.message.reply_text("⚠️ 请输入有效整数", reply_markup=get_main_keyboard())
+
 async def sentiment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
         return
@@ -1739,13 +1858,13 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
                f"成交额: ${btc['volume']:.0f}\n"
                f"监控币种总数: {len(alt_symbols)}\n"
                f"💰 USDT余额: ${balance:,.2f}\n"
+               f"⚡ 当前杠杆: {current_leverage}x\n"
                f"历史样本数: {sum(len(v) for v in diff_history.values())}")
     else:
         msg = "❌ 未获取到BTC数据"
     await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
 async def refreshbalance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """手动强制刷新 USDT 余额"""
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
         return
     await update.message.reply_text("🔄 正在刷新 USDT 余额...", reply_markup=get_main_keyboard())
@@ -1772,11 +1891,11 @@ def run_telegram_bot():
         app.add_handler(CommandHandler("setdiff", setdiff))
         app.add_handler(CommandHandler("setvol", setvol))
         app.add_handler(CommandHandler("setvolatility", setvolatility))
+        app.add_handler(CommandHandler("setleverage", setleverage))
         app.add_handler(CommandHandler("sentiment", sentiment))
         app.add_handler(CommandHandler("debug", debug))
         app.add_handler(CommandHandler("refreshbalance", refreshbalance))
         print("🤖 Telegram Bot 正在运行")
-        # 添加 drop_pending_updates 解决冲突
         app.run_polling(drop_pending_updates=True)
     except Exception as e:
         print(f"❌ Telegram Bot 启动失败: {e}")
@@ -1806,6 +1925,7 @@ def send_startup_notification():
         f"启动时间: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
         f"监控币种: {len(alt_symbols)} 个合约币种\n"
         f"💰 USDT余额: ${balance:,.2f}\n"
+        f"⚡ 当前杠杆: {current_leverage}x\n"
         f"市场情绪: {sentiment_val}/100\n"
         f"动态阈值: 多 {get_dynamic_zscore_threshold('BTC-USDT', 'LONG'):.2f} / 空 {get_dynamic_zscore_threshold('BTC-USDT', 'SHORT'):.2f}\n"
         f"使用 /status 查看详情"
@@ -1817,6 +1937,7 @@ if __name__ == "__main__":
     print(f"🚀 合约胜率增强版 v{VERSION} 启动于 {datetime.now(timezone.utc)}")
     print(f"初始监控: {BTC_SYMBOL} + {', '.join(DEFAULT_ALT_SYMBOLS)}")
     print(f"基础 Z-Score 阈值: 多 {ZSCORE_BASE_LONG} / 空 {ZSCORE_BASE_SHORT}")
+    print(f"默认杠杆: {DEFAULT_LEVERAGE}x")
     print(f"自动过滤: 保留前 {MAX_COINS} 名")
 
     threading.Thread(target=verify_loop, daemon=True).start()
