@@ -153,8 +153,9 @@ def get_usdt_balance(force_refresh=False):
         return usdt_balance_cache["balance"]
 
     try:
-        # 生成 ISO 8601 时间戳（带毫秒和 Z）
-        timestamp = datetime.now(timezone.utc).isoformat(timespec='milliseconds') + 'Z'
+        # 生成 ISO 8601 时间戳（手动构造，确保三位毫秒）
+        dt = datetime.now(timezone.utc)
+        timestamp = dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
         method = "GET"
         request_path = "/api/v5/account/balance?ccy=USDT"
         url = "https://www.okx.com" + request_path
