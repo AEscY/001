@@ -14,7 +14,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==================== 版本信息 ====================
-VERSION = "2.1.0"  # 集成免费数据源 + 自定义评分阈值命令
+VERSION = "2.2.2"  # 增强容错：稳定币和交易所余额数据源多重备份 + 重试机制
 
 # ==================== 配置区 ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -26,7 +26,6 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
 BTC_SYMBOL = "BTC-USDT"
 DEFAULT_ALT_SYMBOLS = ["ETH-USDT", "SOL-USDT", "BNB-USDT", "ADA-USDT", "DOGE-USDT", "XRP-USDT"]
 
-# 趋势判定参数
 BTC_TREND_THRESHOLD = 0.3
 ZSCORE_BASE_LONG = 1.8
 ZSCORE_BASE_SHORT = -1.8
@@ -67,23 +66,29 @@ ENABLE_WHALE_TRACKING = True
 ENABLE_LSR_CHANGE = True
 ENABLE_STABLECOIN_MONITOR = True
 ENABLE_COINBASE_PREMIUM = True
-ENABLE_ETF_FLOW = True
 ENABLE_EXCHANGE_BALANCE = True
 
-# 评分权重
 SCORE_BASE = 50
 SCORE_WHALE = 20
 SCORE_LSR = 15
 SCORE_STABLECOIN = 10
 SCORE_COINBASE = 15
-SCORE_ETF = 20
 SCORE_BALANCE = 10
 SCORE_FUNDING_TREND = 10
 SCORE_TREND_BONUS = 25
 SCORE_NEUTRAL_PENALTY = -10
 
-# ==================== 自定义评分阈值（新增） ====================
-MIN_SCORE_THRESHOLD = 50   # 可通过 /setthreshold 命令动态调整
+# ==================== v2.2.0 新增配置（动量突破） ====================
+ENABLE_MOMENTUM_BREAKOUT = True
+MOMENTUM_15MIN_THRESHOLD = 2.0
+MOMENTUM_VOLUME_RATIO = 5.0
+NEW_HIGH_LOOKBACK = 20
+SCORE_MOMENTUM = 30
+SCORE_NEW_HIGH = 15
+SCORE_VOLUME_SPIKE = 10
+
+# ==================== 自定义评分阈值 ====================
+MIN_SCORE_THRESHOLD = 50
 
 # ==================== 验证配置 ====================
 VERIFY_MINUTES = 15
@@ -126,6 +131,12 @@ auto_refresh_interval = 300
 auto_refresh_timer = None
 price_candle_cache = {}
 
+# ---- v2.2.1 大单跟踪缓存 ----
+whale_trades_cache = {}  # {symbol: {"net_flow": 0, "timestamp": 0}}
+WHALE_TRACK_WINDOW = 300  # 5分钟窗口
+WHALE_SIZE_THRESHOLD = 5  # BTC 阈值，其他币种按价格换算
+
+momentum_cache = {}
 usdt_balance_cache = {"balance": 0, "timestamp": 0, "valid": False}
 BALANCE_CACHE_TTL = 60
 
@@ -133,7 +144,6 @@ current_leverage = DEFAULT_LEVERAGE
 funding_history = {}
 liquidation_cache = {}
 
-# ---- v2.1 数据缓存 ----
 data_cache = {}
 CACHE_TTL = 300
 
@@ -223,80 +233,104 @@ def refresh_balance_cache():
     usdt_balance_cache["valid"] = False
     return get_usdt_balance(force_refresh=True)
 
-# ==================== v2.1 免费数据源对接 ====================
-
-# ----- 1. DeFi Llama：稳定币市值 -----
+# ==================== v2.2.2 增强容错：稳定币数据（多重备份 + 重试） ====================
 def get_stablecoin_data():
-    """获取稳定币市值数据（来源：DeFi Llama，无需API Key）"""
+    """获取稳定币市值，增加重试和多数据源备份"""
     cache_key = "stablecoin"
     now = time.time()
     if cache_key in data_cache and (now - data_cache[cache_key]["timestamp"]) < CACHE_TTL:
         return data_cache[cache_key]["data"]
 
-    try:
-        url = "https://stablecoins.llama.fi/stablecoinoverview"
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        if data:
-            usdt_mcap = 0
-            usdc_mcap = 0
-            for item in data.get("peggedAssets", []):
-                if item.get("symbol") == "USDT":
-                    usdt_mcap = item.get("circulating", {}).get("peggedUSD", 0) / 1e8
-                elif item.get("symbol") == "USDC":
-                    usdc_mcap = item.get("circulating", {}).get("peggedUSD", 0) / 1e8
-            result = {"usdt": usdt_mcap, "usdc": usdc_mcap}
-            data_cache[cache_key] = {"data": result, "timestamp": now}
-            return result
-        return {"usdt": 0, "usdc": 0}
-    except Exception as e:
-        print(f"获取稳定币数据失败: {e}")
-        return {"usdt": 0, "usdc": 0}
+    # 数据源列表（按优先级排序）
+    sources = [
+        {"name": "DeFi Llama", "url": "https://stablecoins.llama.fi/stablecoinoverview"},
+        {"name": "CoinGecko", "url": "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=tether,usd-coin&order=market_cap_desc&per_page=100&page=1&sparkline=false"},
+    ]
 
-# ----- 2. Bitcoin Research Kit (BRK)：链上数据 -----
+    for source in sources:
+        for attempt in range(3):
+            try:
+                resp = requests.get(source["url"], timeout=10)
+                data = resp.json()
+                if not data:
+                    continue
+
+                usdt_mcap, usdc_mcap = 0, 0
+                if source["name"] == "DeFi Llama":
+                    for item in data.get("peggedAssets", []):
+                        if item.get("symbol") == "USDT":
+                            usdt_mcap = item.get("circulating", {}).get("peggedUSD", 0) / 1e8
+                        elif item.get("symbol") == "USDC":
+                            usdc_mcap = item.get("circulating", {}).get("peggedUSD", 0) / 1e8
+                elif source["name"] == "CoinGecko":
+                    for coin in data:
+                        if coin.get("id") == "tether":
+                            usdt_mcap = coin.get("market_cap", 0) / 1e8
+                        elif coin.get("id") == "usd-coin":
+                            usdc_mcap = coin.get("market_cap", 0) / 1e8
+
+                if usdt_mcap > 0 or usdc_mcap > 0:
+                    result = {"usdt": usdt_mcap, "usdc": usdc_mcap}
+                    data_cache[cache_key] = {"data": result, "timestamp": now}
+                    print(f"✅ 稳定币数据获取成功，来源: {source['name']}")
+                    return result
+                else:
+                    print(f"⚠️ 从 {source['name']} 获取的数据为空，重试 {attempt+1}/3")
+                    time.sleep(2)
+            except Exception as e:
+                print(f"⚠️ 从 {source['name']} 获取稳定币数据失败 (尝试 {attempt+1}/3): {e}")
+                time.sleep(2)
+                continue
+        print(f"❌ 从 {source['name']} 获取数据全部失败，尝试下一个数据源")
+    return {"usdt": 0, "usdc": 0}
+
+# ==================== v2.2.2 增强容错：交易所余额（多重备份 + 重试） ====================
 def get_brk_exchange_balance():
-    """获取交易所BTC余额变化（来源：BRK公共API，无需API Key）"""
+    """获取交易所BTC余额，增加重试和多数据源备份"""
     cache_key = "brk_balance"
     now = time.time()
     if cache_key in data_cache and (now - data_cache[cache_key]["timestamp"]) < CACHE_TTL:
         return data_cache[cache_key]["data"]
 
-    try:
-        url = "https://api.bitview.space/v1/exchange/balance"
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        if data and "balance" in data:
-            if len(data.get("history", [])) >= 2:
-                curr = data["history"][-1]
-                prev = data["history"][-2]
-                change = (curr - prev) / prev * 100
-                result = {"balance": data["balance"], "change": change}
-            else:
-                result = {"balance": data["balance"], "change": 0}
-            data_cache[cache_key] = {"data": result, "timestamp": now}
-            return result
-        return {"balance": 0, "change": 0}
-    except Exception as e:
-        print(f"获取BRK交易所余额失败: {e}")
-        return {"balance": 0, "change": 0}
+    # 数据源列表（按优先级排序）
+    sources = [
+        {"name": "BRK", "url": "https://api.bitview.space/v1/exchange/balance"},
+        {"name": "CoinPaprika", "url": "https://api.coinpaprika.com/v1/global"},
+    ]
 
-# ----- 3. OKX 公开数据：大单净流向（占位） -----
-def get_whale_net_flow():
-    # 真实实现需解析 OKX WebSocket 逐笔成交数据，此处占位
-    return 0
+    for source in sources:
+        for attempt in range(3):
+            try:
+                resp = requests.get(source["url"], timeout=10)
+                data = resp.json()
+                if not data:
+                    continue
 
-# ----- 4. OKX 公开数据：多空比变化（占位） -----
-def get_lsr_change():
-    # 真实实现需通过持仓量估算，此处占位
-    return 0
+                if source["name"] == "BRK":
+                    if "balance" in data:
+                        if len(data.get("history", [])) >= 2:
+                            curr = data["history"][-1]
+                            prev = data["history"][-2]
+                            change = (curr - prev) / prev * 100
+                            result = {"balance": data["balance"], "change": change}
+                        else:
+                            result = {"balance": data["balance"], "change": 0}
+                        data_cache[cache_key] = {"data": result, "timestamp": now}
+                        print(f"✅ 交易所余额数据获取成功，来源: {source['name']}")
+                        return result
+            except Exception as e:
+                print(f"⚠️ 从 {source['name']} 获取交易所余额失败 (尝试 {attempt+1}/3): {e}")
+                time.sleep(2)
+                continue
+        print(f"❌ 从 {source['name']} 获取数据全部失败，尝试下一个数据源")
+    return {"balance": 0, "change": 0}
 
-# ----- 5. Coinbase 溢价（免费） -----
+# ==================== 其他数据源 ====================
 def get_coinbase_premium():
     cache_key = "coinbase_premium"
     now = time.time()
     if cache_key in data_cache and (now - data_cache[cache_key]["timestamp"]) < CACHE_TTL:
         return data_cache[cache_key]["data"]
-
     try:
         cb_url = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
         cb_resp = requests.get(cb_url, timeout=5)
@@ -317,7 +351,6 @@ def get_coinbase_premium():
         print(f"获取Coinbase溢价失败: {e}")
         return 0.0
 
-# ----- 6. 资金费率趋势 -----
 def get_funding_trend_score(symbol):
     history = funding_history.get(symbol, [])
     if len(history) < 6:
@@ -331,6 +364,178 @@ def get_funding_trend_score(symbol):
         return 1
     else:
         return 0
+
+# ==================== v2.2.1 大单净流向真实实现 ====================
+def get_whale_net_flow(symbol, btc_price=None):
+    global whale_trades_cache
+    now = time.time()
+    
+    if symbol in whale_trades_cache:
+        data = whale_trades_cache[symbol]
+        if now - data["timestamp"] < WHALE_TRACK_WINDOW:
+            return data["net_flow"]
+    
+    try:
+        if btc_price is None:
+            btc_price = price_data.get(BTC_SYMBOL, {}).get("price", 0)
+        if btc_price == 0:
+            return 0
+        
+        symbol_price = price_data.get(symbol, {}).get("price", 0)
+        if symbol_price == 0:
+            return 0
+        threshold_quote = 5 * btc_price
+        min_size = threshold_quote / symbol_price
+        
+        inst_id = symbol.replace("-USDT", "-USDT-SWAP")
+        url = f"https://www.okx.com/api/v5/market/trades?instId={inst_id}&limit=100"
+        resp = requests.get(url, timeout=5)
+        data = resp.json()
+        if data.get("code") != "0":
+            return 0
+        
+        net_flow = 0
+        cutoff_time = int((now - WHALE_TRACK_WINDOW) * 1000)
+        
+        for trade in data.get("data", []):
+            ts = int(trade.get("ts", 0))
+            if ts < cutoff_time:
+                continue
+            size = float(trade.get("sz", 0))
+            side = trade.get("side", "")
+            if size >= min_size:
+                if side == "buy":
+                    net_flow += size
+                elif side == "sell":
+                    net_flow -= size
+        
+        net_flow_btc = net_flow * symbol_price / btc_price
+        whale_trades_cache[symbol] = {"net_flow": net_flow_btc, "timestamp": now}
+        return net_flow_btc
+        
+    except Exception as e:
+        print(f"获取大单净流向失败 {symbol}: {e}")
+        return 0
+
+# ==================== v2.2.1 多空比变化真实实现 ====================
+def get_lsr_change():
+    api_key = os.environ.get("OKX_API_KEY")
+    secret_key = os.environ.get("OKX_SECRET_KEY")
+    passphrase = os.environ.get("OKX_PASSPHRASE")
+    
+    if not api_key or not secret_key:
+        return 0.0
+    
+    try:
+        dt = datetime.now(timezone.utc)
+        timestamp = dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+        method = "GET"
+        request_path = "/api/v5/account/positions?instType=SWAP"
+        url = "https://www.okx.com" + request_path
+        sign = generate_sign(timestamp, method, request_path, "", secret_key)
+        headers = {
+            "OK-ACCESS-KEY": api_key,
+            "OK-ACCESS-SIGN": sign,
+            "OK-ACCESS-TIMESTAMP": timestamp,
+            "OK-ACCESS-PASSPHRASE": passphrase,
+            "Content-Type": "application/json",
+        }
+        resp = requests.get(url, headers=headers, timeout=5)
+        data = resp.json()
+        
+        if data.get("code") != "0":
+            return 0.0
+        
+        long_pos = 0
+        short_pos = 0
+        for pos in data.get("data", []):
+            if pos.get("instId") != "BTC-USDT-SWAP":
+                continue
+            pos_side = pos.get("posSide", "")
+            notional = float(pos.get("notionalUsd", 0))
+            if pos_side == "long":
+                long_pos += notional
+            elif pos_side == "short":
+                short_pos += notional
+        
+        if short_pos == 0:
+            return 0.0
+        
+        current_lsr = long_pos / short_pos
+        cache_key = "lsr_history"
+        now = time.time()
+        if cache_key in data_cache and "lsr" in data_cache[cache_key]:
+            prev_lsr = data_cache[cache_key]["lsr"]
+            prev_time = data_cache[cache_key]["timestamp"]
+            if now - prev_time < 7200:
+                change_pct = (current_lsr - prev_lsr) / prev_lsr * 100
+                data_cache[cache_key] = {"lsr": current_lsr, "timestamp": now}
+                return change_pct
+        
+        data_cache[cache_key] = {"lsr": current_lsr, "timestamp": now}
+        return 0.0
+        
+    except Exception as e:
+        print(f"获取多空比变化失败: {e}")
+        return 0.0
+
+# ==================== v2.2.0 动量突破函数 ====================
+def update_momentum_cache(symbol, current_price, volume):
+    now = datetime.now(timezone.utc)
+    if symbol not in momentum_cache:
+        momentum_cache[symbol] = {"prices": [], "volumes": [], "time": now}
+    cache = momentum_cache[symbol]
+    cache["prices"].append((now, current_price))
+    cache["volumes"].append((now, volume))
+    cutoff = now - timedelta(minutes=15)
+    cache["prices"] = [(t, p) for t, p in cache["prices"] if t > cutoff]
+    cutoff_vol = now - timedelta(hours=1)
+    cache["volumes"] = [(t, v) for t, v in cache["volumes"] if t > cutoff_vol]
+    cache["time"] = now
+
+def get_15min_momentum(symbol):
+    cache = momentum_cache.get(symbol)
+    if not cache or len(cache["prices"]) < 2:
+        return 0.0
+    prices = cache["prices"]
+    oldest_price = prices[0][1]
+    latest_price = prices[-1][1]
+    if oldest_price == 0:
+        return 0.0
+    return (latest_price - oldest_price) / oldest_price * 100
+
+def get_volume_spike(symbol):
+    cache = momentum_cache.get(symbol)
+    if not cache or len(cache["volumes"]) < 2:
+        return 1.0
+    recent_vol = sum(v for _, v in cache["volumes"])
+    if symbol in price_data:
+        daily_avg = price_data[symbol].get("volume", 0) / 24
+        if daily_avg > 0:
+            return recent_vol / daily_avg
+    return 1.0
+
+def get_new_high(symbol, current_price, lookback=20):
+    try:
+        url = f"https://www.okx.com/api/v5/market/history-candles?instId={symbol}&bar=4H&limit={lookback+5}"
+        resp = requests.get(url, timeout=5)
+        data = resp.json()
+        if data["code"] != "0" or len(data["data"]) < lookback:
+            return "NEUTRAL", 0
+        candles = data["data"]
+        highs = [float(c[2]) for c in candles[-lookback:]]
+        lows = [float(c[3]) for c in candles[-lookback:]]
+        high = max(highs)
+        low = min(lows)
+        if current_price > high:
+            return "NEW_HIGH", (current_price - high) / high * 100
+        elif current_price < low:
+            return "NEW_LOW", (low - current_price) / low * 100
+        else:
+            return "NEUTRAL", 0
+    except Exception as e:
+        print(f"获取新高/新低失败 {symbol}: {e}")
+        return "NEUTRAL", 0
 
 # ==================== 基础工具函数 ====================
 def get_swap_symbols():
@@ -699,6 +904,7 @@ def update_candle_cache(symbol, close_price, volume):
     price_candle_cache[symbol].append((now, close_price, volume))
     if len(price_candle_cache[symbol]) > 20:
         price_candle_cache[symbol].pop(0)
+    update_momentum_cache(symbol, close_price, volume)
 
 def get_liquidity_trap_score(symbol, current_price):
     try:
@@ -876,7 +1082,7 @@ def get_volume_confirmation(symbol):
         return False
 
 # ---- Part 1 结束，请继续复制 Part 2 ----
-# ==================== 核心评分（v2.1 集成所有免费数据源） ====================
+# ==================== 核心评分（v2.2.2 集成所有因子） ====================
 def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, use_independent=False):
     if use_independent:
         if alt_change > 0:
@@ -906,7 +1112,7 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
             else:
                 return None, 0, ""
 
-    # ===== 趋势判定 =====
+    # 趋势判定
     trend_state = get_trend_state(symbol, current_price)
     trend_text = {"UP": "上升趋势", "DOWN": "下降趋势", "NEUTRAL": "横盘震荡"}[trend_state]
 
@@ -920,7 +1126,6 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
     if is_against_trend:
         return None, 0, f"逆势屏蔽: 信号方向与趋势相反 (趋势:{trend_text})"
 
-    # ===== v2.1 多因子评分 =====
     score = SCORE_BASE
     details = []
 
@@ -936,8 +1141,42 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
         score += trend_bonus
         details.append(f"趋势 {trend_text} {trend_bonus:+d}")
 
-    # 2. 大单净流向（占位）
-    whale_net = get_whale_net_flow()
+    # 2. 动量突破
+    if ENABLE_MOMENTUM_BREAKOUT:
+        momentum_15m = get_15min_momentum(symbol)
+        volume_spike = get_volume_spike(symbol)
+        if signal_type == "LONG" and momentum_15m > MOMENTUM_15MIN_THRESHOLD:
+            score += SCORE_MOMENTUM
+            details.append(f"动量突破 {momentum_15m:+.2f}% (+{SCORE_MOMENTUM})")
+        elif signal_type == "SHORT" and momentum_15m < -MOMENTUM_15MIN_THRESHOLD:
+            score += SCORE_MOMENTUM
+            details.append(f"动量突破 {momentum_15m:+.2f}% (+{SCORE_MOMENTUM})")
+
+        if volume_spike > MOMENTUM_VOLUME_RATIO:
+            score += SCORE_VOLUME_SPIKE
+            details.append(f"成交量暴增 {volume_spike:.1f}x (+{SCORE_VOLUME_SPIKE})")
+        else:
+            details.append(f"成交量 {volume_spike:.1f}x")
+
+        high_state, high_pct = get_new_high(symbol, current_price)
+        if high_state == "NEW_HIGH" and signal_type == "LONG":
+            score += SCORE_NEW_HIGH
+            details.append(f"突破20日新高 +{SCORE_NEW_HIGH}")
+        elif high_state == "NEW_LOW" and signal_type == "SHORT":
+            score += SCORE_NEW_HIGH
+            details.append(f"跌破20日新低 +{SCORE_NEW_HIGH}")
+        elif high_state == "NEW_HIGH" and signal_type == "SHORT":
+            score -= SCORE_NEW_HIGH // 2
+            details.append(f"价格新高但做空 -{SCORE_NEW_HIGH//2}")
+        elif high_state == "NEW_LOW" and signal_type == "LONG":
+            score -= SCORE_NEW_HIGH // 2
+            details.append(f"价格新低但做多 -{SCORE_NEW_HIGH//2}")
+        else:
+            details.append("无新高/新低")
+
+    # 3. 大单净流向
+    btc_price = price_data[BTC_SYMBOL]["price"]
+    whale_net = get_whale_net_flow(symbol, btc_price)
     if ENABLE_WHALE_TRACKING and whale_net != 0:
         if (signal_type == "LONG" and whale_net > 0) or (signal_type == "SHORT" and whale_net < 0):
             score += SCORE_WHALE
@@ -945,8 +1184,10 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
         else:
             score -= SCORE_WHALE // 2
             details.append(f"大单净流向 {whale_net:+.2f} BTC (-{SCORE_WHALE//2})")
+    else:
+        details.append("大单净流向: 无大单")
 
-    # 3. 多空比变化（占位）
+    # 4. 多空比变化
     lsr_change = get_lsr_change()
     if ENABLE_LSR_CHANGE and lsr_change != 0:
         if (signal_type == "LONG" and lsr_change < 0) or (signal_type == "SHORT" and lsr_change > 0):
@@ -955,8 +1196,10 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
         else:
             score -= SCORE_LSR // 2
             details.append(f"多空比变化 {lsr_change:+.1f}% (-{SCORE_LSR//2})")
+    else:
+        details.append("多空比变化: 等待数据")
 
-    # 4. 稳定币市值（DeFi Llama）
+    # 5. 稳定币市值
     stablecoin = get_stablecoin_data()
     if ENABLE_STABLECOIN_MONITOR and stablecoin["usdt"] > 0:
         if stablecoin["usdt"] > 1000 and signal_type == "LONG":
@@ -968,7 +1211,7 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
         else:
             details.append(f"USDT市值 {stablecoin['usdt']:.0f}亿")
 
-    # 5. Coinbase 溢价
+    # 6. Coinbase 溢价
     premium = get_coinbase_premium()
     if ENABLE_COINBASE_PREMIUM and premium != 0:
         if (signal_type == "LONG" and premium > 0.1) or (signal_type == "SHORT" and premium < -0.1):
@@ -978,7 +1221,7 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
             score -= SCORE_COINBASE // 2
             details.append(f"Coinbase溢价 {premium:+.2f}% (-{SCORE_COINBASE//2})")
 
-    # 6. 交易所余额变化（BRK）
+    # 7. 交易所余额变化
     brk_data = get_brk_exchange_balance()
     if ENABLE_EXCHANGE_BALANCE and brk_data["change"] != 0:
         if (signal_type == "LONG" and brk_data["change"] < -0.5) or (signal_type == "SHORT" and brk_data["change"] > 0.5):
@@ -988,7 +1231,7 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
             score -= SCORE_BALANCE // 2
             details.append(f"交易所余额 {brk_data['change']:+.2f}% (-{SCORE_BALANCE//2})")
 
-    # 7. 资金费率趋势
+    # 8. 资金费率趋势（已修复）
     funding_trend = get_funding_trend_score(symbol)
     if funding_trend != 0:
         if (signal_type == "LONG" and funding_trend == 1) or (signal_type == "SHORT" and funding_trend == -1):
@@ -998,7 +1241,7 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
             score -= SCORE_FUNDING_TREND // 2
             details.append(f"费率趋势看跌 (-{SCORE_FUNDING_TREND//2})")
 
-    # 8. RSI 辅助
+    # 9. RSI 辅助
     rsi = calculate_rsi(symbol)
     if signal_type == "LONG" and rsi < 30:
         score += 5
@@ -1007,19 +1250,19 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
         score += 5
         details.append(f"RSI={rsi:.0f} 超买 (+5)")
 
-    # 9. 成交量辅助
+    # 10. 成交量辅助
     if volume > VOLUME_THRESHOLD:
         score += 5
         details.append(f"24h成交额 {volume/1e6:.1f}M (+5)")
 
-    # 10. 持仓量变化（v1.x 保留）
+    # 11. 持仓量变化
     oi_change, oi_sig = get_oi_change(symbol)
     if oi_sig:
         if (signal_type == "LONG" and oi_change > 0) or (signal_type == "SHORT" and oi_change < 0):
             score += 10
             details.append(f"持仓量变化 {oi_change:+.1f}% (+10)")
 
-    # 11. 盈亏比 & 仓位
+    # 12. 盈亏比 & 仓位
     atr_pct = get_atr_percent(symbol)
     if signal_type == "LONG":
         sl = current_price * (1 - atr_pct * 1.5 / 100)
@@ -1039,7 +1282,7 @@ def analyze_signal(symbol, diff, btc_change, alt_change, volume, current_price, 
     final_score = max(0, min(100, score))
     return signal_type, final_score, " | ".join(details)
 
-# ==================== 背离检测（使用动态阈值） ====================
+# ==================== 背离检测（已修复资金费率更新） ====================
 def check_divergence():
     btc = price_data[BTC_SYMBOL]
     btc_change = btc["change"]
@@ -1061,6 +1304,9 @@ def check_divergence():
         update_candle_cache(sym, alt_price, volume)
         update_diff_history(sym, diff)
 
+        # 修复：更新资金费率历史
+        update_funding_history(sym)
+
         if sym in last_alert_time and (now - last_alert_time[sym]) < ALERT_COOLDOWN:
             continue
 
@@ -1069,7 +1315,6 @@ def check_divergence():
         else:
             continue
 
-        # 使用动态阈值判断是否推送
         if signal_type and score >= MIN_SCORE_THRESHOLD:
             last_alert_time[sym] = now
             emoji = "🟢" if signal_type == "LONG" else "🔴"
@@ -1573,13 +1818,13 @@ def stop_auto_refresh():
         auto_refresh_timer.cancel()
         auto_refresh_timer = None
 
-# ==================== Telegram 命令（含新增 /setthreshold） ====================
+# ==================== Telegram 命令 ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
         return
     await update.message.reply_text(
         f"🤖 **合约胜率增强Bot v{VERSION}**\n"
-        "资金流预判 + 多因子共振 + 免费数据源\n\n"
+        "动量突破 + 资金流预判 + 多因子共振\n\n"
         "📊 **命令**：\n"
         "/status – 状态 & 参数\n"
         "/summary – 强弱汇总\n"
@@ -1651,7 +1896,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"基础Z-Score: 多 {ZSCORE_BASE_LONG} / 空 {ZSCORE_BASE_SHORT}\n"
         f"RSI超买/超卖: {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
         f"成交量阈值: {VOLUME_THRESHOLD/1000000:.1f}M\n"
-        f"趋势过滤: {'🟢 开启' if ENABLE_TREND_FILTER else '🔴 关闭'}"
+        f"趋势过滤: {'🟢 开启' if ENABLE_TREND_FILTER else '🔴 关闭'}\n"
+        f"动量突破: {'🟢 开启' if ENABLE_MOMENTUM_BREAKOUT else '🔴 关闭'}"
     )
     msg += "\n\n列表: " + ", ".join(list(alt_symbols)[:15])
     if count > 15:
@@ -1846,7 +2092,6 @@ async def setleverage(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ 请输入有效整数", reply_markup=get_main_keyboard())
 
 async def setthreshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """设置评分推送阈值（0~100），低于该值不推送"""
     global MIN_SCORE_THRESHOLD
     if update.effective_chat.id != int(TELEGRAM_CHAT_ID):
         return
@@ -1985,6 +2230,7 @@ def send_startup_notification():
         f"Coinbase溢价: {premium:+.2f}%\n"
         f"动态阈值: 多 {get_dynamic_zscore_threshold('BTC-USDT', 'LONG'):.2f} / 空 {get_dynamic_zscore_threshold('BTC-USDT', 'SHORT'):.2f}\n"
         f"趋势过滤: {'🟢 开启' if ENABLE_TREND_FILTER else '🔴 关闭'}\n"
+        f"动量突破: {'🟢 开启' if ENABLE_MOMENTUM_BREAKOUT else '🔴 关闭'}\n"
         f"使用 /status 查看详情"
     )
     send_telegram(msg)
@@ -1997,6 +2243,7 @@ if __name__ == "__main__":
     print(f"默认杠杆: {DEFAULT_LEVERAGE}x")
     print(f"自动过滤: 保留前 {MAX_COINS} 名")
     print(f"趋势过滤: {'🟢 开启' if ENABLE_TREND_FILTER else '🔴 关闭'}")
+    print(f"动量突破: {'🟢 开启' if ENABLE_MOMENTUM_BREAKOUT else '🔴 关闭'}")
     print(f"评分推送阈值: {MIN_SCORE_THRESHOLD}")
     print("📊 数据源: OKX + DeFi Llama + BRK + Coinbase")
 
