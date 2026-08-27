@@ -14,7 +14,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==================== 版本信息 ====================
-VERSION = "3.4.0"  # 精简版：5个核心因子 + 独立触发 + 信号冷却
+VERSION = "3.5.0"  # 增加乖离率扣分机制，避免追高接盘
 
 # ==================== 配置区 ====================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -26,23 +26,29 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
 BTC_SYMBOL = "BTC-USDT"
 DEFAULT_ALT_SYMBOLS = ["ETH-USDT", "SOL-USDT", "BNB-USDT", "ADA-USDT", "DOGE-USDT", "XRP-USDT"]
 
-# ==================== 评分权重（5个核心因子） ====================
-WEIGHT_TREND = 40      # 自身趋势
-WEIGHT_DIVERGENCE = 30 # 背离差
-WEIGHT_VOLUME = 15     # 成交量
-WEIGHT_RSI = 10        # RSI
-WEIGHT_FUNDING = 5     # 资金费率
+# ==================== 评分权重（6个核心因子） ====================
+WEIGHT_TREND = 35       # 自身趋势
+WEIGHT_DIVERGENCE = 25  # 背离差
+WEIGHT_VOLUME = 15      # 成交量
+WEIGHT_RSI = 10         # RSI
+WEIGHT_FUNDING = 5      # 资金费率
+WEIGHT_BIAS = 10        # 乖离率（新增，避免追高）
 
-SCORE_THRESHOLD_HIGH = 70    # 高置信度
-SCORE_THRESHOLD_MEDIUM = 50  # 中等置信度（低于此不推送）
+SCORE_THRESHOLD_HIGH = 70
+SCORE_THRESHOLD_MEDIUM = 50
+
+# ==================== 乖离率阈值 ====================
+BIAS_SAFE = 3        # 低于此值加分
+BIAS_WARN = 5        # 超过此值开始扣分
+BIAS_DANGER = 8      # 超过此值扣大分
 
 # ==================== 信号冷却配置 ====================
-COOLDOWN_HOURS = 24          # 同币种同方向冷却时间（小时）
+COOLDOWN_HOURS = 24
 
 # ==================== 基础参数 ====================
 RSI_OVERBOUGHT = 70
 RSI_OVERSOLD = 30
-VOLUME_THRESHOLD = 1000000   # 100万 USDT
+VOLUME_THRESHOLD = 1000000
 ALERT_COOLDOWN = 120
 SUMMARY_MIN_DIFF = 0.3
 
@@ -79,7 +85,7 @@ for sym in alt_symbols:
     price_data[sym] = {"price": 0, "change": 0, "volume": 0}
 
 diff_history = {}
-last_alert_time = {}          # 记录最后一次推送时间 {symbol: {"timestamp": 0, "direction": "LONG/SHORT"}}
+last_alert_time = {}
 ws_instance = None
 ws_lock = threading.Lock()
 restart_flag = False
@@ -93,8 +99,7 @@ usdt_balance_cache = {"balance": 0, "timestamp": 0, "valid": False}
 BALANCE_CACHE_TTL = 60
 
 current_leverage = DEFAULT_LEVERAGE
-funding_history = deque(maxlen=24)  # 仅用于当前费率，不计算标准差
-MIN_SCORE_THRESHOLD = 50            # 可通过 /setthreshold 调整
+MIN_SCORE_THRESHOLD = 50
 
 # ==================== 菜单键盘 ====================
 def get_main_keyboard():
@@ -273,18 +278,6 @@ def get_atr_percent(symbol, period=14):
     except:
         return 0.5
 
-def get_open_interest(symbol):
-    try:
-        swap_symbol = symbol.replace("-USDT", "-USDT-SWAP")
-        url = f"https://www.okx.com/api/v5/public/open-interest?instId={swap_symbol}"
-        resp = requests.get(url, timeout=5)
-        data = resp.json()
-        if data["code"] == "0" and data["data"]:
-            return float(data["data"][0]["oi"])
-        return 0.0
-    except:
-        return 0.0
-
 def calculate_position(current_price, atr_pct, score, account_balance=None, leverage=None):
     if account_balance is None:
         account_balance = get_usdt_balance()
@@ -308,13 +301,42 @@ def get_session_score():
         return -5
     return 0
 
+# ==================== 乖离率计算（v3.5 核心新增） ====================
+def get_bias_score(current_price, ema50, signal_type):
+    """
+    计算乖离率评分，避免追高/追低
+    返回 (分数, 偏离百分比, 描述)
+    """
+    if ema50 == 0:
+        return 0, 0, "无EMA数据"
+    bias = (current_price - ema50) / ema50 * 100
+    
+    if signal_type == "LONG":
+        if bias < BIAS_SAFE:
+            return WEIGHT_BIAS, bias, f"低位启动 ({bias:+.1f}%)"
+        elif bias < BIAS_WARN:
+            return WEIGHT_BIAS // 2, bias, f"正常范围 ({bias:+.1f}%)"
+        elif bias < BIAS_DANGER:
+            return -8, bias, f"偏高 ({bias:+.1f}%) 追高风险"
+        else:
+            return -15, bias, f"严重追高 ({bias:+.1f}%) 接盘风险"
+    else:  # SHORT
+        if bias > -BIAS_SAFE:
+            return WEIGHT_BIAS, bias, f"低位启动 ({bias:+.1f}%)"
+        elif bias > -BIAS_WARN:
+            return WEIGHT_BIAS // 2, bias, f"正常范围 ({bias:+.1f}%)"
+        elif bias > -BIAS_DANGER:
+            return -8, bias, f"偏低 ({bias:+.1f}%) 追空风险"
+        else:
+            return -15, bias, f"严重追空 ({bias:+.1f}%) 接盘风险"
+
 # ==================== 趋势判定 ====================
 def get_coin_trend(symbol, current_price):
     ema20 = get_ema(symbol, 20)
     ema50 = get_ema(symbol, 50)
     ema100 = get_ema(symbol, 100)
     if ema20 == 0 or ema50 == 0 or ema100 == 0:
-        return "NEUTRAL", 0
+        return "NEUTRAL", 0, 0
     # 多头排列
     if ema20 > ema50 > ema100:
         ema_state = "UP"
@@ -332,28 +354,27 @@ def get_coin_trend(symbol, current_price):
         price_state = "NEUTRAL"
     # 综合判定
     if ema_state == "UP" and (price_state == "UP" or price_state == "NEUTRAL"):
-        return "UP", WEIGHT_TREND
+        return "UP", WEIGHT_TREND, ema50
     elif ema_state == "DOWN" and (price_state == "DOWN" or price_state == "NEUTRAL"):
-        return "DOWN", WEIGHT_TREND
+        return "DOWN", WEIGHT_TREND, ema50
     else:
         if price_state == "UP":
-            return "UP", WEIGHT_TREND // 2
+            return "UP", WEIGHT_TREND // 2, ema50
         elif price_state == "DOWN":
-            return "DOWN", WEIGHT_TREND // 2
+            return "DOWN", WEIGHT_TREND // 2, ema50
         else:
-            return "NEUTRAL", 0
+            return "NEUTRAL", 0, ema50
 
 # ==================== 背离差计算 ====================
 def get_divergence_score(alt_change, btc_change):
     diff = alt_change - btc_change
-    # 将背离差映射到 0~WEIGHT_DIVERGENCE 分
     score = min(WEIGHT_DIVERGENCE, max(0, abs(diff) * 8))
     return score, diff
 
-# ==================== 评分引擎（5个核心因子） ====================
+# ==================== 评分引擎（6个核心因子） ====================
 def analyze_signal(symbol, current_price, volume, alt_change, btc_change):
     # ---- 1. 趋势判定 ----
-    trend_dir, trend_score = get_coin_trend(symbol, current_price)
+    trend_dir, trend_score, ema50 = get_coin_trend(symbol, current_price)
     if trend_dir == "NEUTRAL":
         return None, 0, "趋势不明朗"
 
@@ -362,12 +383,11 @@ def analyze_signal(symbol, current_price, volume, alt_change, btc_change):
     if div_score < 5:
         return None, 0, "背离差不足"
 
-    # 确定信号方向：趋势方向 + 背离方向一致
+    # 确定信号方向
     if (trend_dir == "UP" and diff > 0) or (trend_dir == "DOWN" and diff < 0):
         signal_type = "LONG" if trend_dir == "UP" else "SHORT"
         direction_bonus = 10
     else:
-        # 趋势与背离方向不一致，仍可能产生信号但扣分
         signal_type = "LONG" if diff > 0 else "SHORT"
         direction_bonus = -10
 
@@ -396,7 +416,7 @@ def analyze_signal(symbol, current_price, volume, alt_change, btc_change):
             funding_score = -WEIGHT_FUNDING
         else:
             funding_score = 0
-    else:  # SHORT
+    else:
         if funding > 0.005:
             funding_score = WEIGHT_FUNDING
         elif funding < -0.01:
@@ -404,9 +424,11 @@ def analyze_signal(symbol, current_price, volume, alt_change, btc_change):
         else:
             funding_score = 0
 
+    # ---- 6. 乖离率（v3.5 核心新增，避免追高接盘） ----
+    bias_score, bias_pct, bias_desc = get_bias_score(current_price, ema50, signal_type)
+    
     # ---- 综合评分 ----
-    base_score = trend_score + div_score + vol_score + rsi_score + funding_score + direction_bonus
-    # 加上时段分（微调）
+    base_score = trend_score + div_score + vol_score + rsi_score + funding_score + bias_score + direction_bonus
     session_score = get_session_score()
     total_score = max(0, min(100, base_score + session_score))
 
@@ -416,7 +438,8 @@ def analyze_signal(symbol, current_price, volume, alt_change, btc_change):
         f"背离差: {diff:+.2f}% ({div_score:.0f}分)",
         f"成交量: {'达标' if vol_score>0 else '一般'} ({vol_score}分)",
         f"RSI: {rsi:.0f} ({rsi_score:+d}分)",
-        f"费率: {funding*100:.3f}% ({funding_score:+d}分)"
+        f"费率: {funding*100:.3f}% ({funding_score:+d}分)",
+        f"乖离率: {bias_pct:+.1f}% ({bias_score:+d}分) {bias_desc}"
     ]
     if direction_bonus != 0:
         details.append(f"方向一致性: {direction_bonus:+d}分")
@@ -438,7 +461,7 @@ def update_cooldown(symbol, signal_type):
 
 # ---- Part 1 结束，请继续复制 Part 2 ----
 
-# ==================== 核心检测（独立触发，不依赖BTC波动） ====================
+# ==================== 核心检测 ====================
 def check_divergence():
     btc = price_data[BTC_SYMBOL]
     btc_change = btc["change"]
@@ -456,16 +479,13 @@ def check_divergence():
         alt_price = alt["price"]
         volume = alt.get("volume", 0)
 
-        # 独立触发：不再依赖 BTC 波动
         signal_type, score, details = analyze_signal(sym, alt_price, volume, alt_change, btc_change)
         if not signal_type:
             continue
 
-        # 冷却检查
         if check_cooldown(sym, signal_type):
             continue
 
-        # 评分分级
         if score >= SCORE_THRESHOLD_HIGH:
             level = "高置信度"
             emoji = "🟢" if signal_type == "LONG" else "🔴"
@@ -473,21 +493,18 @@ def check_divergence():
             level = "中等置信度"
             emoji = "🟡" if signal_type == "LONG" else "🟠"
         else:
-            continue  # 低置信度不推送
+            continue
 
-        # 更新冷却
         update_cooldown(sym, signal_type)
 
         action = "做多" if signal_type == "LONG" else "做空"
         inst_id = sym
         okx_url = f"https://www.okx.com/zh-hans/trade-swap/{inst_id.lower()}" if inst_id in swap_symbols else f"https://www.okx.com/zh-hans/markets/spot/{inst_id.lower()}"
 
-        # 获取趋势方向（仅显示）
-        trend_dir, _ = get_coin_trend(sym, alt_price)
+        trend_dir, _, ema50 = get_coin_trend(sym, alt_price)
         trend_emoji = {"UP": "🟢", "DOWN": "🔴", "NEUTRAL": "⚪"}.get(trend_dir, "⚪")
         trend_label = {"UP": "上升", "DOWN": "下降", "NEUTRAL": "横盘"}.get(trend_dir, "横盘")
 
-        # 计算盈亏比
         atr_pct = get_atr_percent(sym)
         if signal_type == "LONG":
             sl = alt_price * (1 - atr_pct * ATR_STOP_MULTIPLIER / 100)
@@ -498,7 +515,6 @@ def check_divergence():
             tp = alt_price * (1 - atr_pct * ATR_TAKE_MULTIPLIER / 100)
             rr = (alt_price - tp) / (sl - alt_price) if (sl - alt_price) > 0 else 0
 
-        # 建议仓位
         position_size = calculate_position(alt_price, atr_pct, score)
 
         alert_text = (
@@ -518,19 +534,17 @@ def check_divergence():
         full_msg = header + "\n\n".join(alerts)
         send_telegram(full_msg, parse_mode='Markdown')
 
-        # 记录待验证信号
         with PENDING_LOCK:
             for a in alerts:
-                # 提取币种（从消息中解析，简单处理）
-                # 由于消息格式固定，提取 [sym] 中的内容
                 import re
                 match = re.search(r'【.*?】([A-Z]+-[A-Z]+)', a)
                 if match:
                     sym = match.group(1)
+                    price_match = re.search(r'价格: \$([\d.]+)', a)
                     PENDING_SIGNALS.append({
                         "symbol": sym,
                         "signal_type": "LONG" if "做多" in a else "SHORT",
-                        "price": float(re.search(r'价格: \$([\d.]+)', a).group(1)) if re.search(r'价格: \$([\d.]+)', a) else 0,
+                        "price": float(price_match.group(1)) if price_match else 0,
                         "timestamp": time.time(),
                         "verified": False,
                         "status": "pending"
@@ -603,7 +617,7 @@ def verify_loop():
             for idx in sorted(to_remove, reverse=True):
                 PENDING_SIGNALS.pop(idx)
 
-# ==================== WebSocket（仅订阅tickers） ====================
+# ==================== WebSocket ====================
 def restart_websocket():
     global ws_instance, restart_flag
     with ws_lock:
@@ -911,7 +925,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         f"🤖 **合约胜率增强Bot v{VERSION}**\n"
-        "核心逻辑：趋势 + 背离 + 成交量 + RSI + 费率\n\n"
+        "核心逻辑：趋势 + 背离 + 成交量 + RSI + 费率 + 乖离率\n"
+        "⚡ 乖离率自动扣分，避免追高接盘\n\n"
         "📊 **命令**：\n"
         "/status – 状态 & 参数\n"
         "/summary – 强弱汇总\n"
@@ -954,7 +969,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 近24小时验证统计:\n"
         f"  总数: {total} | ✅成功: {success} | ❌失败: {failed} | ⏳失效: {expired}\n"
         f"  成功率: {success_rate}\n"
-        f"⏰ 信号冷却: {COOLDOWN_HOURS}小时 (同币同向)"
+        f"⏰ 信号冷却: {COOLDOWN_HOURS}小时 (同币同向)\n"
+        f"📈 乖离率扣分: 偏离EMA50 > {BIAS_DANGER}% 扣大分"
     )
     msg += "\n\n列表: " + ", ".join(list(alt_symbols)[:15])
     if count > 15:
@@ -1118,7 +1134,8 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
                f"💰 USDT余额: ${balance:,.2f}\n"
                f"⚡ 当前杠杆: {current_leverage}x\n"
                f"🎯 评分推送阈值: {MIN_SCORE_THRESHOLD}\n"
-               f"⏰ 信号冷却: {COOLDOWN_HOURS}小时")
+               f"⏰ 信号冷却: {COOLDOWN_HOURS}小时\n"
+               f"📈 乖离率扣分阈值: >{BIAS_DANGER}% 扣大分")
     else:
         msg = "❌ 未获取到BTC数据"
     await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
@@ -1183,6 +1200,7 @@ def send_startup_notification():
         f"⚡ 当前杠杆: {current_leverage}x\n"
         f"🎯 评分推送阈值: {MIN_SCORE_THRESHOLD}\n"
         f"⏰ 信号冷却: {COOLDOWN_HOURS}小时\n"
+        f"📈 乖离率扣分: 偏离EMA50 > {BIAS_DANGER}% 扣大分\n"
         f"使用 /status 查看详情"
     )
     send_telegram(msg)
@@ -1195,6 +1213,7 @@ if __name__ == "__main__":
     print(f"自动过滤: 保留前 {MAX_COINS} 名")
     print(f"评分推送阈值: {MIN_SCORE_THRESHOLD}")
     print(f"信号冷却: {COOLDOWN_HOURS}小时")
+    print(f"乖离率扣分阈值: >{BIAS_DANGER}% 扣大分")
 
     threading.Thread(target=verify_loop, daemon=True).start()
     threading.Thread(target=auto_scan_new_coins, daemon=True).start()
